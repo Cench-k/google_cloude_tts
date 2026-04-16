@@ -167,8 +167,10 @@ source = st.radio(
 )
 text = (text_direct if source == "직접 입력" else text_file).strip()
 
+max_sentence_bytes = 600 if is_chirp else None
+
 if text:
-    chunks_preview = split_text(text)
+    chunks_preview = split_text(text, max_sentence_bytes=max_sentence_bytes)
     st.info(
         f"📝 총 {len(text):,}자 · {len(chunks_preview)}개 청크로 분할 예정"
     )
@@ -224,6 +226,7 @@ if generate_btn and text:
             language_code=language_code,
             speaking_rate=speaking_rate,
             pitch=pitch,
+            max_sentence_bytes=max_sentence_bytes,
             progress_cb=update,
         )
         progress.progress(1.0, "완료!")
