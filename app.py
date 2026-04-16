@@ -32,9 +32,33 @@ if not api_key:
     st.stop()
 
 
+SAMPLE_TEXTS = {
+    "ko-KR": "안녕하세요. 오늘도 좋은 하루 되세요.",
+    "en-US": "Hello. Have a wonderful day.",
+    "ja-JP": "こんにちは。良い一日をお過ごしください。",
+    "zh-CN": "你好。祝你今天愉快。",
+}
+
+
+def _voice_tier(voice_name: str) -> str:
+    parts = voice_name.split("-")
+    if len(parts) < 3:
+        return "Unknown"
+    tier = parts[2]
+    if tier == "Chirp3" and len(parts) >= 4 and parts[3] == "HD":
+        return "Chirp3-HD"
+    return tier
+
+
 @st.cache_data(ttl=3600, show_spinner="목소리 목록 로딩 중...")
 def get_voices(key, lang):
     return list_voices(key, lang)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_sample(key, voice, lang):
+    return synthesize(key, SAMPLE_TEXTS.get(lang, SAMPLE_TEXTS["en-US"]),
+                      voice, language_code=lang)
 
 
 with st.sidebar:
@@ -55,18 +79,16 @@ with st.sidebar:
         st.error("사용 가능한 목소리가 없습니다.")
         st.stop()
 
-    tiers = sorted(
-        {
-            v["name"].split("-")[2]
-            for v in voices
-            if len(v["name"].split("-")) >= 3
-        }
+    tiers = sorted({_voice_tier(v["name"]) for v in voices})
+    tier_filter = st.multiselect(
+        "목소리 등급",
+        tiers,
+        default=tiers,
+        help="Chirp3-HD는 최신·고품질, Neural2는 자연스러움, Standard는 저비용",
     )
-    default_tiers = [t for t in ["Neural2", "Wavenet"] if t in tiers] or tiers
-    tier_filter = st.multiselect("목소리 등급", tiers, default=default_tiers)
 
     filtered = (
-        [v for v in voices if any(t in v["name"] for t in tier_filter)]
+        [v for v in voices if _voice_tier(v["name"]) in tier_filter]
         if tier_filter
         else voices
     )
@@ -75,15 +97,41 @@ with st.sidebar:
         filtered = voices
 
     voice_options = {
-        f"{v['name']} · {v['ssmlGender']}": v["name"] for v in filtered
+        f"[{_voice_tier(v['name'])}] {v['name']} · {v['ssmlGender']}": v["name"]
+        for v in filtered
     }
     voice_label = st.selectbox("목소리 선택", list(voice_options.keys()))
     voice_name = voice_options[voice_label]
 
-    speaking_rate = st.slider("속도", 0.25, 4.0, 1.0, 0.05)
-    pitch = st.slider("피치", -20.0, 20.0, 0.0, 1.0)
+    if st.button("🎧 이 목소리 샘플 듣기", use_container_width=True):
+        with st.spinner("샘플 생성 중..."):
+            try:
+                sample_audio = get_sample(api_key, voice_name, language_code)
+                st.audio(sample_audio, format="audio/mp3")
+            except Exception as e:
+                st.error(f"샘플 생성 실패: {e}")
 
-    st.caption("💡 Neural2 > Wavenet > Standard 순으로 자연스럽습니다.")
+    is_chirp = "Chirp3" in voice_name
+    speaking_rate = st.slider(
+        "속도",
+        0.25,
+        2.0 if is_chirp else 4.0,
+        1.0,
+        0.05,
+    )
+    pitch = st.slider(
+        "피치",
+        -20.0,
+        20.0,
+        0.0,
+        1.0,
+        disabled=is_chirp,
+        help="Chirp3-HD는 피치 조절을 지원하지 않습니다." if is_chirp else None,
+    )
+    if is_chirp:
+        pitch = 0.0
+
+    st.caption("💡 Chirp3-HD > Neural2 > Wavenet > Standard 순으로 자연스럽습니다.")
 
 tab1, tab2 = st.tabs(["✏️ 직접 입력", "📁 파일 업로드"])
 
