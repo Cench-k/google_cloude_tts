@@ -82,6 +82,20 @@ with st.sidebar:
 cloud_key = _get_key("GOOGLE_TTS_API_KEY")
 gemini_key = _get_key("GEMINI_API_KEY", fallback=cloud_key)
 
+
+def _parse_backup_keys(raw: str) -> list:
+    if not raw:
+        return []
+    parts = []
+    for line in raw.replace(",", "\n").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            parts.append(line)
+    return parts
+
+
+backup_keys_env = _get_key("GEMINI_API_KEYS_BACKUP", fallback="") or ""
+
 if engine == "Gemini TTS (신규)":
     if not gemini_key:
         st.error(
@@ -132,6 +146,19 @@ with st.sidebar:
             placeholder="예: in a cheerful tone / 차분하게 / 뉴스 앵커처럼",
             help="'Say {프롬프트}: {본문}' 형식으로 전달되어 톤/감정 제어",
         )
+
+        with st.expander("🔑 백업 API 키 (할당량 초과 시 자동 전환)"):
+            backup_raw = st.text_area(
+                "추가 키 (한 줄에 하나)",
+                value=backup_keys_env,
+                height=100,
+                placeholder="AIzaSy...\nAIzaSy...",
+                help="주 키 할당량이 소진되면 위에서부터 순서대로 다음 키로 전환합니다.",
+            )
+        backup_keys = _parse_backup_keys(backup_raw)
+        gemini_key_pool = [active_key] + backup_keys
+        st.caption(f"🔑 총 {len(gemini_key_pool)}개 키 준비됨")
+
         language_code = None
         speaking_rate = None
         pitch = None
@@ -294,15 +321,27 @@ if preview_btn and text:
 if generate_btn and text:
     progress = st.progress(0.0, "준비 중...")
     status = st.empty()
+    rotate_log = st.empty()
 
-    def update(done, total):
+    rotation_events = []
+
+    def update_gemini(done, total, active_idx):
+        msg = f"{done}/{total} 청크 처리 중... (키 #{active_idx})"
+        progress.progress(done / total, msg)
+
+    def update_cloud(done, total):
         progress.progress(done / total, f"{done}/{total} 청크 처리 중...")
+
+    def on_rotate(old_idx, new_idx, err_msg):
+        rotation_events.append(f"⚠️ 키 #{old_idx + 1} 할당량 초과 → 키 #{new_idx + 1}로 전환")
+        rotate_log.warning("\n".join(rotation_events))
 
     try:
         if engine == "Gemini TTS (신규)":
             merged, parts = synthesize_gemini_long(
-                active_key, text, model, voice_name, style_prompt,
-                progress_cb=update,
+                gemini_key_pool, text, model, voice_name, style_prompt,
+                progress_cb=update_gemini,
+                rotate_cb=on_rotate,
             )
         else:
             merged, parts = synthesize_long(
@@ -310,7 +349,7 @@ if generate_btn and text:
                 language_code=language_code,
                 speaking_rate=speaking_rate, pitch=pitch,
                 max_sentence_bytes=max_sentence_bytes,
-                progress_cb=update,
+                progress_cb=update_cloud,
             )
         progress.progress(1.0, "완료!")
         status.success(f"✅ 생성 완료 · {len(parts)}개 청크 · 총 {len(merged):,} 바이트")

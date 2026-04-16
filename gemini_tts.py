@@ -53,6 +53,20 @@ GEMINI_VOICES = [
 GEMINI_MAX_BYTES = 4000
 
 
+class QuotaExceeded(RuntimeError):
+    pass
+
+
+def _is_quota_error(status_code: int, body_text: str) -> bool:
+    if status_code == 429:
+        return True
+    if status_code in (403, 400):
+        lower = body_text.lower()
+        if "quota" in lower or "resource_exhausted" in lower or "rate limit" in lower:
+            return True
+    return False
+
+
 def _pcm_to_wav(pcm_bytes: bytes, rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav:
@@ -95,6 +109,8 @@ def synthesize_gemini(
         timeout=180,
     )
     if resp.status_code != 200:
+        if _is_quota_error(resp.status_code, resp.text):
+            raise QuotaExceeded(f"할당량 초과 ({resp.status_code}): {resp.text}")
         raise RuntimeError(f"Gemini TTS API 오류 ({resp.status_code}): {resp.text}")
     data = resp.json()
     try:
@@ -108,26 +124,57 @@ def synthesize_gemini(
     return _pcm_to_wav(pcm, rate=rate)
 
 
+def _call_with_rotation(keys, fn, on_rotate=None):
+    last_err = None
+    for i, key in enumerate(keys):
+        try:
+            return fn(key), i
+        except QuotaExceeded as e:
+            last_err = e
+            if on_rotate and i + 1 < len(keys):
+                on_rotate(i, i + 1, str(e))
+            continue
+    raise last_err or RuntimeError("사용 가능한 API 키가 없습니다.")
+
+
 def synthesize_gemini_long(
-    api_key: str,
+    api_keys,
     text: str,
     model: str,
     voice_name: str,
     style_prompt: str = "",
     progress_cb=None,
+    rotate_cb=None,
 ):
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    api_keys = [k for k in api_keys if k]
+    if not api_keys:
+        raise ValueError("API 키가 없습니다.")
+
     chunks = split_text(text, max_bytes=GEMINI_MAX_BYTES)
     if not chunks:
         raise ValueError("입력 텍스트가 비어 있습니다.")
+
     pcm_parts = []
     wav_parts = []
     rate = 24000
+    current_idx = 0
+
     for i, chunk in enumerate(chunks):
-        wav = synthesize_gemini(api_key, chunk, model, voice_name, style_prompt)
+        remaining_keys = api_keys[current_idx:]
+
+        def _try(k, c=chunk):
+            return synthesize_gemini(k, c, model, voice_name, style_prompt)
+
+        wav, offset = _call_with_rotation(remaining_keys, _try, on_rotate=rotate_cb)
+        current_idx += offset
+
         pcm, rate = _wav_to_pcm(wav)
         pcm_parts.append(pcm)
         wav_parts.append(wav)
         if progress_cb:
-            progress_cb(i + 1, len(chunks))
+            progress_cb(i + 1, len(chunks), current_idx + 1)
+
     merged = _pcm_to_wav(b"".join(pcm_parts), rate=rate)
     return merged, wav_parts
