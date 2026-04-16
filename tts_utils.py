@@ -4,7 +4,7 @@ import requests
 
 TTS_ENDPOINT = "https://texttospeech.googleapis.com/v1/text:synthesize"
 VOICES_ENDPOINT = "https://texttospeech.googleapis.com/v1/voices"
-MAX_CHARS = 4500
+MAX_BYTES = 4500
 
 
 def list_voices(api_key, language_code="ko-KR"):
@@ -19,7 +19,25 @@ def list_voices(api_key, language_code="ko-KR"):
     return voices
 
 
-def split_text(text, max_chars=MAX_CHARS):
+def _bytelen(s: str) -> int:
+    return len(s.encode("utf-8"))
+
+
+def _force_split_by_bytes(s: str, max_bytes: int) -> list[str]:
+    out = []
+    buf = ""
+    for ch in s:
+        if _bytelen(buf) + _bytelen(ch) > max_bytes:
+            out.append(buf)
+            buf = ch
+        else:
+            buf += ch
+    if buf:
+        out.append(buf)
+    return out
+
+
+def split_text(text, max_bytes=MAX_BYTES):
     text = text.strip()
     if not text:
         return []
@@ -29,15 +47,16 @@ def split_text(text, max_chars=MAX_CHARS):
     for s in sentences:
         if not s:
             continue
-        if len(current) + len(s) <= max_chars:
+        if _bytelen(current) + _bytelen(s) <= max_bytes:
             current += s
         else:
             if current:
                 chunks.append(current)
                 current = ""
-            if len(s) > max_chars:
-                for i in range(0, len(s), max_chars):
-                    chunks.append(s[i : i + max_chars])
+            if _bytelen(s) > max_bytes:
+                pieces = _force_split_by_bytes(s, max_bytes)
+                chunks.extend(pieces[:-1])
+                current = pieces[-1] if pieces else ""
             else:
                 current = s
     if current:
