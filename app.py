@@ -167,7 +167,7 @@ source = st.radio(
 )
 text = (text_direct if source == "직접 입력" else text_file).strip()
 
-max_sentence_bytes = 600 if is_chirp else None
+max_sentence_bytes = 300 if is_chirp else None
 
 if text:
     chunks_preview = split_text(text, max_sentence_bytes=max_sentence_bytes)
