@@ -50,7 +50,8 @@ GEMINI_VOICES = [
     ("Sulafat", "Warm 따뜻"),
 ]
 
-GEMINI_MAX_BYTES = 4000
+GEMINI_MAX_BYTES = 1200
+GEMINI_TIMEOUT = 300
 
 
 class QuotaExceeded(RuntimeError):
@@ -106,7 +107,7 @@ def synthesize_gemini(
         url,
         params={"key": api_key},
         json=body,
-        timeout=180,
+        timeout=GEMINI_TIMEOUT,
     )
     if resp.status_code != 200:
         if _is_quota_error(resp.status_code, resp.text):
@@ -114,9 +115,28 @@ def synthesize_gemini(
         raise RuntimeError(f"Gemini TTS API 오류 ({resp.status_code}): {resp.text}")
     data = resp.json()
     try:
-        inline = data["candidates"][0]["content"]["parts"][0]["inlineData"]
+        candidate = data["candidates"][0]
     except (KeyError, IndexError):
-        raise RuntimeError(f"Gemini 응답 파싱 실패: {data}")
+        raise RuntimeError(f"Gemini 응답에 candidate 없음: {data}")
+    parts = candidate.get("content", {}).get("parts", [])
+    finish_reason = candidate.get("finishReason", "UNKNOWN")
+    if not parts:
+        hints = {
+            "OTHER": "출력 길이 초과 가능성 — 청크 크기를 줄여보세요",
+            "MAX_TOKENS": "모델 출력 토큰 한도 초과 — 청크 크기 축소 필요",
+            "SAFETY": "안전 필터에 의해 차단",
+            "RECITATION": "저작권/인용 탐지에 의해 차단",
+            "PROHIBITED_CONTENT": "금지된 콘텐츠",
+            "BLOCKLIST": "차단 목록에 걸림",
+        }
+        hint = hints.get(finish_reason, "원인 불명")
+        raise RuntimeError(
+            f"Gemini가 오디오를 반환하지 않음 (finishReason={finish_reason}): {hint}"
+        )
+    try:
+        inline = parts[0]["inlineData"]
+    except (KeyError, TypeError):
+        raise RuntimeError(f"응답 parts에 inlineData 없음: {parts[0]}")
     pcm = base64.b64decode(inline["data"])
     mime = inline.get("mimeType", "")
     m = re.search(r"rate=(\d+)", mime)
