@@ -50,8 +50,18 @@ GEMINI_VOICES = [
     ("Sulafat", "Warm 따뜻"),
 ]
 
-GEMINI_MAX_BYTES = 1200
 GEMINI_TIMEOUT = 300
+
+MODEL_MAX_BYTES = {
+    "gemini-3.1-flash-tts-preview": 1500,
+    "gemini-2.5-flash-preview-tts": 1200,
+    "gemini-2.5-pro-preview-tts": 1200,
+}
+DEFAULT_MAX_BYTES = 1200
+
+
+def get_max_bytes(model: str) -> int:
+    return MODEL_MAX_BYTES.get(model, DEFAULT_MAX_BYTES)
 
 
 class QuotaExceeded(RuntimeError):
@@ -89,18 +99,25 @@ def synthesize_gemini(
     model: str,
     voice_name: str,
     style_prompt: str = "",
+    seed: int = None,
+    temperature: float = None,
 ) -> bytes:
     content_text = f"Say {style_prompt}: {text}" if style_prompt.strip() else text
-    body = {
-        "contents": [{"parts": [{"text": content_text}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": voice_name},
-                },
+    generation_config = {
+        "responseModalities": ["AUDIO"],
+        "speechConfig": {
+            "voiceConfig": {
+                "prebuiltVoiceConfig": {"voiceName": voice_name},
             },
         },
+    }
+    if seed is not None:
+        generation_config["seed"] = int(seed)
+    if temperature is not None:
+        generation_config["temperature"] = float(temperature)
+    body = {
+        "contents": [{"parts": [{"text": content_text}]}],
+        "generationConfig": generation_config,
     }
     url = GEMINI_ENDPOINT.format(model=model)
     resp = requests.post(
@@ -163,6 +180,8 @@ def synthesize_gemini_long(
     model: str,
     voice_name: str,
     style_prompt: str = "",
+    seed: int = None,
+    temperature: float = None,
     progress_cb=None,
     rotate_cb=None,
 ):
@@ -172,7 +191,7 @@ def synthesize_gemini_long(
     if not api_keys:
         raise ValueError("API 키가 없습니다.")
 
-    chunks = split_text(text, max_bytes=GEMINI_MAX_BYTES)
+    chunks = split_text(text, max_bytes=get_max_bytes(model))
     if not chunks:
         raise ValueError("입력 텍스트가 비어 있습니다.")
 
@@ -185,9 +204,18 @@ def synthesize_gemini_long(
         remaining_keys = api_keys[current_idx:]
 
         def _try(k, c=chunk):
-            return synthesize_gemini(k, c, model, voice_name, style_prompt)
+            return synthesize_gemini(
+                k, c, model, voice_name, style_prompt,
+                seed=seed, temperature=temperature,
+            )
 
-        wav, offset = _call_with_rotation(remaining_keys, _try, on_rotate=rotate_cb)
+        try:
+            wav, offset = _call_with_rotation(remaining_keys, _try, on_rotate=rotate_cb)
+        except QuotaExceeded as e:
+            raise QuotaExceeded(
+                f"모든 API 키의 할당량이 소진되었습니다 ({len(api_keys)}개 모두 실패). "
+                f"백업 키를 추가하거나 내일까지 기다리세요. 마지막 응답: {e}"
+            ) from e
         current_idx += offset
 
         pcm, rate = _wav_to_pcm(wav)

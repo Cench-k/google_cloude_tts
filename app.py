@@ -9,6 +9,8 @@ from file_utils import read_file
 from gemini_tts import (
     GEMINI_MODELS,
     GEMINI_VOICES,
+    QuotaExceeded,
+    get_max_bytes,
     synthesize_gemini,
     synthesize_gemini_long,
 )
@@ -147,6 +149,30 @@ with st.sidebar:
             help="'Say {프롬프트}: {본문}' 형식으로 전달되어 톤/감정 제어",
         )
 
+        with st.expander("🎯 목소리 일관성 (청크 간 드리프트 방지)"):
+            consistency_mode = st.checkbox(
+                "일관성 모드",
+                value=True,
+                help="seed 고정 + 낮은 temperature로 청크 간 톤 유지",
+            )
+            if consistency_mode:
+                seed_value = st.number_input(
+                    "Seed",
+                    min_value=0,
+                    max_value=2**31 - 1,
+                    value=42,
+                    step=1,
+                    help="같은 seed는 같은 목소리 특성을 재현. 결과가 이상하면 값 변경",
+                )
+                temperature_value = st.slider(
+                    "Temperature",
+                    0.0, 2.0, 0.5, 0.05,
+                    help="낮을수록 일관적, 높을수록 다양함 (0.3~0.7 권장)",
+                )
+            else:
+                seed_value = None
+                temperature_value = None
+
         with st.expander("🔑 백업 API 키 (할당량 초과 시 자동 전환)"):
             backup_raw = st.text_area(
                 "추가 키 (한 줄에 하나)",
@@ -157,7 +183,7 @@ with st.sidebar:
             )
         backup_keys = _parse_backup_keys(backup_raw)
         gemini_key_pool = [active_key] + backup_keys
-        st.caption(f"🔑 총 {len(gemini_key_pool)}개 키 준비됨")
+        st.caption(f"🔑 총 {len(gemini_key_pool)}개 키 준비됨 · 청크 크기: {get_max_bytes(model)}B")
 
         language_code = None
         speaking_rate = None
@@ -307,6 +333,7 @@ if preview_btn and text:
             if engine == "Gemini TTS (신규)":
                 audio = synthesize_gemini(
                     active_key, sample_text, model, voice_name, style_prompt,
+                    seed=seed_value, temperature=temperature_value,
                 )
             else:
                 audio = synthesize(
@@ -340,6 +367,7 @@ if generate_btn and text:
         if engine == "Gemini TTS (신규)":
             merged, parts = synthesize_gemini_long(
                 gemini_key_pool, text, model, voice_name, style_prompt,
+                seed=seed_value, temperature=temperature_value,
                 progress_cb=update_gemini,
                 rotate_cb=on_rotate,
             )
@@ -378,5 +406,16 @@ if generate_btn and text:
                 mime="application/zip",
                 use_container_width=True,
             )
+    except QuotaExceeded as e:
+        progress.empty()
+        st.error(
+            "🚫 **모든 API 키의 할당량이 소진되었습니다.**\n\n"
+            f"{e}\n\n"
+            "**해결 방법**\n"
+            "- 사이드바 '🔑 백업 API 키'에 추가 키를 등록하고 다시 시도\n"
+            "- AI Studio에서 새 키 발급 (https://aistudio.google.com/apikey)\n"
+            "- 무료 한도는 자정(태평양 시각)에 초기화됩니다",
+            icon="🚫",
+        )
     except Exception as e:
         st.error(f"생성 실패: {e}")
