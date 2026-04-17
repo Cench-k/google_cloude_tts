@@ -65,11 +65,8 @@ def _refine_long_sentence(s: str, max_sentence_bytes: int) -> list[str]:
     return out
 
 
-def split_text(text, max_bytes=MAX_BYTES, max_sentence_bytes=None):
-    text = text.strip()
-    if not text:
-        return []
-    sentences = re.split(r"(?<=[.!?。！？\n])\s*", text)
+def _split_paragraph_by_sentences(para, max_bytes, max_sentence_bytes=None):
+    sentences = re.split(r"(?<=[.!?。！？\n])\s*", para)
     units = []
     for s in sentences:
         if not s:
@@ -104,6 +101,45 @@ def split_text(text, max_bytes=MAX_BYTES, max_sentence_bytes=None):
                 current = pieces[-1] if pieces else ""
             else:
                 current = unit
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def split_text(text, max_bytes=MAX_BYTES, max_sentence_bytes=None):
+    text = text.strip()
+    if not text:
+        return []
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paragraphs:
+        return []
+
+    chunks = []
+    current = ""
+    sep = "\n\n"
+
+    for para in paragraphs:
+        if current and _bytelen(current) + _bytelen(sep) + _bytelen(para) <= max_bytes:
+            current += sep + para
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        if _bytelen(para) <= max_bytes:
+            current = para
+            continue
+
+        sub_chunks = _split_paragraph_by_sentences(
+            para, max_bytes, max_sentence_bytes=max_sentence_bytes
+        )
+        if not sub_chunks:
+            continue
+        chunks.extend(sub_chunks[:-1])
+        current = sub_chunks[-1]
+
     if current:
         chunks.append(current)
     return chunks
