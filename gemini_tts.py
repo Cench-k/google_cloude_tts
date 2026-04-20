@@ -137,8 +137,9 @@ def synthesize_gemini(
         "generationConfig": generation_config,
     }
     url = GEMINI_ENDPOINT.format(model=model)
-    MAX_ATTEMPTS = 4
+    MAX_ATTEMPTS = 6
     TRANSIENT_CODES = {500, 502, 503, 504}
+    BACKOFFS = [2, 4, 7, 10, 15]
     last_error = None
     resp = None
     for attempt in range(MAX_ATTEMPTS):
@@ -152,7 +153,7 @@ def synthesize_gemini(
         except requests.exceptions.ReadTimeout as e:
             last_error = e
             if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(2 * (attempt + 1))
+                time.sleep(BACKOFFS[min(attempt, len(BACKOFFS) - 1)])
                 continue
             raise RuntimeError(
                 f"Gemini TTS 응답 지연 (타임아웃 {GEMINI_TIMEOUT}s × {MAX_ATTEMPTS}회 재시도 실패). "
@@ -161,7 +162,7 @@ def synthesize_gemini(
 
         if resp.status_code in TRANSIENT_CODES and attempt < MAX_ATTEMPTS - 1:
             last_error = RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
-            time.sleep(2 * (attempt + 1))
+            time.sleep(BACKOFFS[min(attempt, len(BACKOFFS) - 1)])
             continue
         break
 
