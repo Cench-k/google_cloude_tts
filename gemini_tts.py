@@ -121,8 +121,11 @@ def synthesize_gemini(
         "generationConfig": generation_config,
     }
     url = GEMINI_ENDPOINT.format(model=model)
-    last_timeout = None
-    for attempt in range(2):
+    MAX_ATTEMPTS = 4
+    TRANSIENT_CODES = {500, 502, 503, 504}
+    last_error = None
+    resp = None
+    for attempt in range(MAX_ATTEMPTS):
         try:
             resp = requests.post(
                 url,
@@ -130,19 +133,32 @@ def synthesize_gemini(
                 json=body,
                 timeout=GEMINI_TIMEOUT,
             )
-            break
         except requests.exceptions.ReadTimeout as e:
-            last_timeout = e
-            if attempt == 0:
-                time.sleep(2)
+            last_error = e
+            if attempt < MAX_ATTEMPTS - 1:
+                time.sleep(2 * (attempt + 1))
                 continue
             raise RuntimeError(
-                f"Gemini TTS 응답 지연 (타임아웃 {GEMINI_TIMEOUT}s × 2회 재시도 실패). "
+                f"Gemini TTS 응답 지연 (타임아웃 {GEMINI_TIMEOUT}s × {MAX_ATTEMPTS}회 재시도 실패). "
                 f"청크 크기를 더 줄이거나 잠시 후 다시 시도해 보세요."
-            ) from last_timeout
+            ) from e
+
+        if resp.status_code in TRANSIENT_CODES and attempt < MAX_ATTEMPTS - 1:
+            last_error = RuntimeError(f"{resp.status_code}: {resp.text[:200]}")
+            time.sleep(2 * (attempt + 1))
+            continue
+        break
+
+    if resp is None:
+        raise RuntimeError(f"Gemini TTS 호출 실패: {last_error}")
     if resp.status_code != 200:
         if _is_quota_error(resp.status_code, resp.text):
             raise QuotaExceeded(f"할당량 초과 ({resp.status_code}): {resp.text}")
+        if resp.status_code in TRANSIENT_CODES:
+            raise RuntimeError(
+                f"Gemini TTS 서버 부하 지속 ({resp.status_code}, {MAX_ATTEMPTS}회 재시도 후에도 실패). "
+                f"잠시 후 다시 시도해 보세요.\n{resp.text[:300]}"
+            )
         raise RuntimeError(f"Gemini TTS API 오류 ({resp.status_code}): {resp.text}")
     data = resp.json()
     try:
