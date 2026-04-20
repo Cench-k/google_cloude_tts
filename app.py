@@ -137,11 +137,24 @@ with st.sidebar:
 
         if st.button("🎧 이 목소리 샘플 듣기", use_container_width=True):
             with st.spinner("샘플 생성 중..."):
-                try:
-                    sample_audio = get_gemini_sample(active_key, model, voice_name)
+                last_err = None
+                sample_audio = None
+                for idx, key in enumerate(gemini_key_pool):
+                    try:
+                        sample_audio = get_gemini_sample(key, model, voice_name)
+                        if idx > 0:
+                            st.caption(f"키 #{idx + 1}로 샘플 생성됨 (앞 키들은 할당량 초과)")
+                        break
+                    except QuotaExceeded as e:
+                        last_err = e
+                        continue
+                    except Exception as e:
+                        last_err = e
+                        break
+                if sample_audio is not None:
                     st.audio(sample_audio, format="audio/wav")
-                except Exception as e:
-                    st.error(f"샘플 생성 실패: {e}")
+                else:
+                    st.error(f"샘플 생성 실패: {last_err}")
 
         style_prompt = st.text_input(
             "스타일 프롬프트 (선택)",
