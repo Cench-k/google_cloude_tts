@@ -1,6 +1,7 @@
 import base64
 import io
 import re
+import time
 import wave
 
 import requests
@@ -53,11 +54,11 @@ GEMINI_VOICES = [
 GEMINI_TIMEOUT = 300
 
 MODEL_MAX_BYTES = {
-    "gemini-3.1-flash-tts-preview": 2000,
-    "gemini-2.5-flash-preview-tts": 1500,
-    "gemini-2.5-pro-preview-tts": 1500,
+    "gemini-3.1-flash-tts-preview": 1500,
+    "gemini-2.5-flash-preview-tts": 1200,
+    "gemini-2.5-pro-preview-tts": 1200,
 }
-DEFAULT_MAX_BYTES = 1500
+DEFAULT_MAX_BYTES = 1200
 
 
 def get_max_bytes(model: str) -> int:
@@ -120,12 +121,25 @@ def synthesize_gemini(
         "generationConfig": generation_config,
     }
     url = GEMINI_ENDPOINT.format(model=model)
-    resp = requests.post(
-        url,
-        params={"key": api_key},
-        json=body,
-        timeout=GEMINI_TIMEOUT,
-    )
+    last_timeout = None
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                url,
+                params={"key": api_key},
+                json=body,
+                timeout=GEMINI_TIMEOUT,
+            )
+            break
+        except requests.exceptions.ReadTimeout as e:
+            last_timeout = e
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            raise RuntimeError(
+                f"Gemini TTS 응답 지연 (타임아웃 {GEMINI_TIMEOUT}s × 2회 재시도 실패). "
+                f"청크 크기를 더 줄이거나 잠시 후 다시 시도해 보세요."
+            ) from last_timeout
     if resp.status_code != 200:
         if _is_quota_error(resp.status_code, resp.text):
             raise QuotaExceeded(f"할당량 초과 ({resp.status_code}): {resp.text}")
