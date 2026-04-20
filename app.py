@@ -1,9 +1,7 @@
 import io
-import os
 import zipfile
 
 import streamlit as st
-from dotenv import load_dotenv
 
 from file_utils import read_file
 from gemini_tts import (
@@ -17,22 +15,8 @@ from gemini_tts import (
 )
 from tts_utils import list_voices, split_text, synthesize, synthesize_long
 
-load_dotenv()
-
 st.set_page_config(page_title="Google TTS 도우미", page_icon="🔊", layout="wide")
 st.title("🔊 Google TTS 도우미")
-
-
-def _get_key(name, fallback=None):
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-    except Exception:
-        pass
-    val = os.getenv(name)
-    if val:
-        return val
-    return fallback
 
 
 SAMPLE_TEXTS = {
@@ -82,11 +66,7 @@ with st.sidebar:
         help="Gemini TTS는 Zephyr/Puck 등 캐릭터 목소리와 스타일 프롬프트 지원",
     )
 
-cloud_key = _get_key("GOOGLE_TTS_API_KEY")
-gemini_key = _get_key("GEMINI_API_KEY", fallback=cloud_key)
-
-
-def _parse_backup_keys(raw: str) -> list:
+def _parse_keys(raw: str) -> list:
     if not raw:
         return []
     parts = []
@@ -97,21 +77,40 @@ def _parse_backup_keys(raw: str) -> list:
     return parts
 
 
-backup_keys_env = _get_key("GEMINI_API_KEYS_BACKUP", fallback="") or ""
+with st.sidebar:
+    with st.expander("🔑 API 키 입력", expanded=True):
+        if engine == "Gemini TTS (신규)":
+            gemini_keys_raw = st.text_area(
+                "Gemini API 키 (한 줄에 하나)",
+                key="gemini_keys_raw",
+                height=120,
+                placeholder="AIzaSy...\nAIzaSy... (여러 개면 할당량 초과 시 자동 전환)",
+                help="AI Studio(https://aistudio.google.com/apikey)에서 발급. "
+                     "여러 키 입력 시 위에서부터 순서대로 로테이션.",
+            )
+            gemini_key_pool = _parse_keys(gemini_keys_raw)
+        else:
+            cloud_key_input = st.text_input(
+                "Google Cloud TTS API 키",
+                key="cloud_key_input",
+                type="password",
+                placeholder="AIzaSy...",
+                help="Google Cloud 콘솔 → APIs & Services → Credentials",
+            )
+            cloud_key = cloud_key_input.strip() if cloud_key_input else ""
 
 if engine == "Gemini TTS (신규)":
-    if not gemini_key:
-        st.error(
-            "Gemini API 키가 설정되지 않았습니다. "
-            "`.env`에 `GEMINI_API_KEY` 또는 `GOOGLE_TTS_API_KEY`를 등록해주세요."
-        )
+    if not gemini_key_pool:
+        with st.sidebar:
+            st.warning("Gemini API 키를 입력하세요.")
+        st.info("👈 사이드바의 '🔑 API 키 입력'에 Gemini API 키를 입력해주세요.")
         st.stop()
-    active_key = gemini_key
+    active_key = gemini_key_pool[0]
 else:
     if not cloud_key:
-        st.error(
-            "`GOOGLE_TTS_API_KEY`가 설정되지 않았습니다."
-        )
+        with st.sidebar:
+            st.warning("Google Cloud TTS 키를 입력하세요.")
+        st.info("👈 사이드바의 '🔑 API 키 입력'에 Cloud TTS API 키를 입력해주세요.")
         st.stop()
     active_key = cloud_key
 
@@ -174,16 +173,6 @@ with st.sidebar:
                 seed_value = None
                 temperature_value = None
 
-        with st.expander("🔑 백업 API 키 (할당량 초과 시 자동 전환)"):
-            backup_raw = st.text_area(
-                "추가 키 (한 줄에 하나)",
-                value=backup_keys_env,
-                height=100,
-                placeholder="AIzaSy...\nAIzaSy...",
-                help="주 키 할당량이 소진되면 위에서부터 순서대로 다음 키로 전환합니다.",
-            )
-        backup_keys = _parse_backup_keys(backup_raw)
-        gemini_key_pool = [active_key] + backup_keys
         st.caption(f"🔑 총 {len(gemini_key_pool)}개 키 준비됨 · 청크 크기: {get_max_bytes(model)}B")
 
         language_code = None
