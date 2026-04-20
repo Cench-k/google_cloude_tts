@@ -99,6 +99,17 @@ def _wav_to_pcm(wav_bytes: bytes) -> tuple[bytes, int]:
         return wav.readframes(wav.getnframes()), wav.getframerate()
 
 
+def merge_wavs(wav_bytes_list: list) -> bytes:
+    if not wav_bytes_list:
+        return b""
+    pcm_parts = []
+    rate = 24000
+    for wav in wav_bytes_list:
+        pcm, rate = _wav_to_pcm(wav)
+        pcm_parts.append(pcm)
+    return _pcm_to_wav(b"".join(pcm_parts), rate=rate)
+
+
 def synthesize_gemini(
     api_key: str,
     text: str,
@@ -236,50 +247,20 @@ def synthesize_gemini_long(
     rate = 24000
     current_idx = 0
 
-    def _synthesize_one(chunk_text, depth=0):
-        nonlocal current_idx
-        remaining_keys = api_keys[current_idx:]
-
-        def _try(k, c=chunk_text):
-            return synthesize_gemini(
-                k, c, model, voice_name, style_prompt,
-                seed=seed, temperature=temperature,
-            )
-
-        try:
-            wav, offset = _call_with_rotation(remaining_keys, _try, on_rotate=rotate_cb)
-        except OutputOverflow:
-            if depth >= 4 or len(chunk_text) <= 1:
-                raise
-            sub_chunks = _split_for_retry(chunk_text)
-            if len(sub_chunks) < 2:
-                raise
-            wavs = []
-            for sub in sub_chunks:
-                sub_wav = _synthesize_one(sub, depth=depth + 1)
-                wavs.append(sub_wav)
-            return wavs
-        current_idx += offset
-        return wav
-
-    def _flatten(wavs_or_wav):
-        if isinstance(wavs_or_wav, list):
-            out = []
-            for w in wavs_or_wav:
-                out.extend(_flatten(w))
-            return out
-        return [wavs_or_wav]
-
     for i, chunk in enumerate(chunks):
         try:
-            result = _synthesize_one(chunk)
+            wavs, current_idx = synthesize_gemini_chunk(
+                api_keys, current_idx, chunk, model, voice_name,
+                style_prompt=style_prompt, seed=seed, temperature=temperature,
+                rotate_cb=rotate_cb,
+            )
         except QuotaExceeded as e:
             raise QuotaExceeded(
                 f"모든 API 키의 할당량이 소진되었습니다 ({len(api_keys)}개 모두 실패). "
                 f"백업 키를 추가하거나 내일까지 기다리세요. 마지막 응답: {e}"
             ) from e
 
-        for wav in _flatten(result):
+        for wav in wavs:
             pcm, rate = _wav_to_pcm(wav)
             pcm_parts.append(pcm)
             wav_parts.append(wav)
@@ -288,6 +269,49 @@ def synthesize_gemini_long(
 
     merged = _pcm_to_wav(b"".join(pcm_parts), rate=rate)
     return merged, wav_parts
+
+
+def synthesize_gemini_chunk(
+    api_keys,
+    start_key_idx: int,
+    chunk_text: str,
+    model: str,
+    voice_name: str,
+    style_prompt: str = "",
+    seed: int = None,
+    temperature: float = None,
+    rotate_cb=None,
+    _depth: int = 0,
+):
+    """단일 청크를 처리. 키 로테이션 + OutputOverflow 자동 분할-재시도.
+    Returns (list[wav_bytes], new_key_idx)."""
+    remaining_keys = api_keys[start_key_idx:]
+
+    def _try(k):
+        return synthesize_gemini(
+            k, chunk_text, model, voice_name, style_prompt,
+            seed=seed, temperature=temperature,
+        )
+
+    try:
+        wav, offset = _call_with_rotation(remaining_keys, _try, on_rotate=rotate_cb)
+        return [wav], start_key_idx + offset
+    except OutputOverflow:
+        if _depth >= 4 or len(chunk_text) <= 1:
+            raise
+        sub_chunks = _split_for_retry(chunk_text)
+        if len(sub_chunks) < 2:
+            raise
+        all_wavs = []
+        idx = start_key_idx
+        for sub in sub_chunks:
+            sub_wavs, idx = synthesize_gemini_chunk(
+                api_keys, idx, sub, model, voice_name,
+                style_prompt=style_prompt, seed=seed, temperature=temperature,
+                rotate_cb=rotate_cb, _depth=_depth + 1,
+            )
+            all_wavs.extend(sub_wavs)
+        return all_wavs, idx
 
 
 def _split_for_retry(text: str) -> list:

@@ -11,8 +11,9 @@ from gemini_tts import (
     GEMINI_VOICES,
     QuotaExceeded,
     get_max_bytes,
+    merge_wavs,
     synthesize_gemini,
-    synthesize_gemini_long,
+    synthesize_gemini_chunk,
 )
 from tts_utils import list_voices, split_text, synthesize, synthesize_long
 
@@ -362,77 +363,149 @@ if preview_btn and text:
         except Exception as e:
             st.error(f"생성 실패: {e}")
 
+if "tts_job" not in st.session_state:
+    st.session_state.tts_job = None
+
 if generate_btn and text:
-    progress = st.progress(0.0, "준비 중...")
-    status = st.empty()
-    rotate_log = st.empty()
+    if engine == "Gemini TTS (신규)":
+        job_chunks = split_text(text, max_bytes=get_max_bytes(model))
+    else:
+        job_chunks = split_text(text, max_sentence_bytes=max_sentence_bytes)
 
-    rotation_events = []
+    if not job_chunks:
+        st.error("입력 텍스트가 비어 있습니다.")
+    else:
+        st.session_state.tts_job = {
+            "engine": engine,
+            "chunks": job_chunks,
+            "done_parts": [],
+            "key_idx": 0,
+            "rotation_events": [],
+            "params": {
+                "model": model,
+                "voice_name": voice_name,
+                "style_prompt": style_prompt,
+                "seed": seed_value,
+                "temperature": temperature_value,
+                "keys": gemini_key_pool if engine == "Gemini TTS (신규)" else [active_key],
+                "language_code": language_code,
+                "speaking_rate": speaking_rate,
+                "pitch": pitch,
+            },
+            "status": "running",
+            "error": None,
+        }
+        st.rerun()
 
-    def update_gemini(done, total, active_idx):
-        msg = f"{done}/{total} 청크 처리 중... (키 #{active_idx})"
-        progress.progress(done / total, msg)
+job = st.session_state.tts_job
 
-    def update_cloud(done, total):
-        progress.progress(done / total, f"{done}/{total} 청크 처리 중...")
+if job and job["status"] in ("running", "error"):
+    total = len(job["chunks"])
+    done = len(job["done_parts"])
+    progress = st.progress(done / total if total else 0,
+                           f"{done}/{total} 청크 완료 · 다음 청크 처리 중...")
+    if job["rotation_events"]:
+        st.warning("\n".join(job["rotation_events"]))
 
-    def on_rotate(old_idx, new_idx, err_msg):
-        rotation_events.append(f"⚠️ 키 #{old_idx + 1} 할당량 초과 → 키 #{new_idx + 1}로 전환")
-        rotate_log.warning("\n".join(rotation_events))
+    col_cancel, col_retry = st.columns(2)
+    with col_cancel:
+        if st.button("❌ 생성 취소", use_container_width=True):
+            st.session_state.tts_job = None
+            st.rerun()
+    with col_retry:
+        if job["status"] == "error" and st.button("🔁 이어서 재시도", use_container_width=True, type="primary"):
+            job["status"] = "running"
+            job["error"] = None
+            st.session_state.tts_job = job
+            st.rerun()
 
-    try:
-        if engine == "Gemini TTS (신규)":
-            merged, parts = synthesize_gemini_long(
-                gemini_key_pool, text, model, voice_name, style_prompt,
-                seed=seed_value, temperature=temperature_value,
-                progress_cb=update_gemini,
-                rotate_cb=on_rotate,
+    if job["status"] == "error":
+        st.error(f"청크 {done + 1} 실패: {job['error']}")
+    else:
+        chunk = job["chunks"][done]
+        params = job["params"]
+
+        def _on_rotate(old_i, new_i, err_msg):
+            job["rotation_events"].append(
+                f"⚠️ 키 #{old_i + 1} 할당량 초과 → 키 #{new_i + 1}로 전환"
             )
-        else:
-            merged, parts = synthesize_long(
-                active_key, text, voice_name,
-                language_code=language_code,
-                speaking_rate=speaking_rate, pitch=pitch,
-                max_sentence_bytes=max_sentence_bytes,
-                progress_cb=update_cloud,
-            )
-        progress.progress(1.0, "완료!")
-        status.success(f"✅ 생성 완료 · {len(parts)}개 청크 · 총 {len(merged):,} 바이트")
 
-        st.audio(merged, format=_audio_mime())
+        try:
+            if job["engine"] == "Gemini TTS (신규)":
+                wavs, new_idx = synthesize_gemini_chunk(
+                    params["keys"], job["key_idx"], chunk,
+                    params["model"], params["voice_name"],
+                    style_prompt=params["style_prompt"],
+                    seed=params["seed"], temperature=params["temperature"],
+                    rotate_cb=_on_rotate,
+                )
+                job["key_idx"] = new_idx
+                merged_chunk = merge_wavs(wavs)
+                job["done_parts"].append(merged_chunk)
+            else:
+                audio = synthesize(
+                    params["keys"][0], chunk, params["voice_name"],
+                    language_code=params["language_code"],
+                    speaking_rate=params["speaking_rate"], pitch=params["pitch"],
+                )
+                job["done_parts"].append(audio)
 
-        ext = _audio_ext()
-        if save_mode == "하나의 파일로 합치기":
-            st.download_button(
-                f"💾 {ext.upper()} 다운로드",
-                merged,
-                file_name=f"tts_output.{ext}",
-                mime=_audio_mime(),
-                use_container_width=True,
+            if len(job["done_parts"]) >= total:
+                job["status"] = "done"
+            st.session_state.tts_job = job
+            st.rerun()
+        except QuotaExceeded as e:
+            job["status"] = "error"
+            job["error"] = (
+                "🚫 모든 API 키의 할당량이 소진되었습니다. "
+                "사이드바에 백업 키를 추가하거나 내일 다시 시도하세요.\n\n"
+                f"{e}"
             )
-        else:
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for i, part in enumerate(parts, 1):
-                    zf.writestr(f"tts_part_{i:03d}.{ext}", part)
-            buf.seek(0)
-            st.download_button(
-                "💾 ZIP 다운로드",
-                buf,
-                file_name="tts_output.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-    except QuotaExceeded as e:
-        progress.empty()
-        st.error(
-            "🚫 **모든 API 키의 할당량이 소진되었습니다.**\n\n"
-            f"{e}\n\n"
-            "**해결 방법**\n"
-            "- 사이드바 '🔑 백업 API 키'에 추가 키를 등록하고 다시 시도\n"
-            "- AI Studio에서 새 키 발급 (https://aistudio.google.com/apikey)\n"
-            "- 무료 한도는 자정(태평양 시각)에 초기화됩니다",
-            icon="🚫",
+            st.session_state.tts_job = job
+            st.rerun()
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            st.session_state.tts_job = job
+            st.rerun()
+
+if job and job["status"] == "done":
+    total = len(job["chunks"])
+    parts = job["done_parts"]
+    engine_finished = job["engine"]
+    ext = "wav" if engine_finished == "Gemini TTS (신규)" else "mp3"
+    mime = "audio/wav" if engine_finished == "Gemini TTS (신규)" else "audio/mp3"
+
+    if engine_finished == "Gemini TTS (신규)":
+        merged = merge_wavs(parts)
+    else:
+        merged = b"".join(parts)
+
+    st.success(f"✅ 생성 완료 · {total}개 청크 · 총 {len(merged):,} 바이트")
+    st.audio(merged, format=mime)
+
+    if save_mode == "하나의 파일로 합치기":
+        st.download_button(
+            f"💾 {ext.upper()} 다운로드",
+            merged,
+            file_name=f"tts_output.{ext}",
+            mime=mime,
+            use_container_width=True,
         )
-    except Exception as e:
-        st.error(f"생성 실패: {e}")
+    else:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, part in enumerate(parts, 1):
+                zf.writestr(f"tts_part_{i:03d}.{ext}", part)
+        buf.seek(0)
+        st.download_button(
+            "💾 ZIP 다운로드",
+            buf,
+            file_name="tts_output.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+    if st.button("🗑️ 결과 지우고 새로 시작", use_container_width=True):
+        st.session_state.tts_job = None
+        st.rerun()
