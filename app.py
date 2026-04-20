@@ -290,11 +290,28 @@ source = st.radio(
 text = (text_direct if source == "직접 입력" else text_file).strip()
 
 if text:
+    text_bytes = len(text.encode("utf-8"))
     if engine == "Gemini TTS (신규)":
-        chunks_preview = split_text(text, max_bytes=4000)
+        chunk_max = get_max_bytes(model)
+        chunks_preview = split_text(text, max_bytes=chunk_max)
+        limit_hint = f"청크 한도 {chunk_max:,}B"
     else:
         chunks_preview = split_text(text, max_sentence_bytes=max_sentence_bytes)
-    st.info(f"📝 총 {len(text):,}자 · {len(chunks_preview)}개 청크로 분할 예정")
+        limit_hint = "Cloud TTS 기본 청크"
+    st.info(
+        f"📝 총 {len(text):,}자 · {text_bytes:,} bytes · "
+        f"{len(chunks_preview)}개 청크로 분할 예정 ({limit_hint})"
+    )
+    with st.expander("🔍 청크 경계 확인 (각 청크 끝 40자 미리보기)"):
+        for i, chunk in enumerate(chunks_preview, 1):
+            chunk_bytes = len(chunk.encode("utf-8"))
+            tail = chunk[-40:].replace("\n", "↵")
+            ends_on_break = chunk.rstrip().endswith((".", "!", "?", "。", "！", "？"))
+            mark = "✅" if ends_on_break else "⚠️"
+            st.write(
+                f"{mark} **청크 {i}** ({chunk_bytes:,}B) "
+                f"··· `{tail}`"
+            )
 
 col1, col2 = st.columns(2)
 with col1:
