@@ -142,9 +142,9 @@ def synthesize_gemini(
         "generationConfig": generation_config,
     }
     url = GEMINI_ENDPOINT.format(model=model)
-    MAX_ATTEMPTS = 6
+    MAX_ATTEMPTS = 3
     TRANSIENT_CODES = {500, 502, 503, 504}
-    BACKOFFS = [2, 4, 7, 10, 15]
+    BACKOFFS = [2, 4]
     last_error = None
     resp = None
     for attempt in range(MAX_ATTEMPTS):
@@ -302,8 +302,8 @@ def synthesize_gemini_chunk(
     try:
         wav, offset = _call_with_rotation(remaining_keys, _try, on_rotate=rotate_cb)
         return [wav], start_key_idx + offset
-    except (OutputOverflow, ServerError):
-        if _depth >= 4 or len(chunk_text) <= 1:
+    except OutputOverflow:
+        if _depth >= 2 or len(chunk_text) <= 1:
             raise
         sub_chunks = _split_for_retry(chunk_text)
         if len(sub_chunks) < 2:
