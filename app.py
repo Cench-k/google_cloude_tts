@@ -409,7 +409,7 @@ if job and job["status"] in ("running", "error"):
     if job["rotation_events"]:
         st.warning("\n".join(job["rotation_events"]))
 
-    col_cancel, col_retry = st.columns(2)
+    col_cancel, col_retry, col_skip = st.columns(3)
     with col_cancel:
         if st.button("❌ 생성 취소", use_container_width=True):
             st.session_state.tts_job = None
@@ -420,9 +420,24 @@ if job and job["status"] in ("running", "error"):
             job["error"] = None
             st.session_state.tts_job = job
             st.rerun()
+    with col_skip:
+        if job["status"] == "error" and st.button("⏭️ 이 청크 건너뛰기", use_container_width=True):
+            job["done_parts"].append(None)
+            job["status"] = "running" if len(job["done_parts"]) < total else "done"
+            job["error"] = None
+            st.session_state.tts_job = job
+            st.rerun()
 
     if job["status"] == "error":
+        failing_chunk = job["chunks"][done]
         st.error(f"청크 {done + 1} 실패: {job['error']}")
+        with st.expander(f"📄 실패한 청크 {done + 1} 본문 ({len(failing_chunk.encode('utf-8')):,} bytes)"):
+            st.text(failing_chunk)
+            st.caption(
+                "💡 5xx가 계속 발생하면 이 청크에 구글 모델이 민감하게 반응하는 "
+                "특정 문자열이 있을 가능성. 건너뛰고 결과 확인 후 해당 부분만 "
+                "따로 편집해서 재생성하는 방법도 있습니다."
+            )
     else:
         chunk = job["chunks"][done]
         params = job["params"]
@@ -474,16 +489,22 @@ if job and job["status"] in ("running", "error"):
 if job and job["status"] == "done":
     total = len(job["chunks"])
     parts = job["done_parts"]
+    valid_parts = [p for p in parts if p is not None]
+    skipped = total - len(valid_parts)
     engine_finished = job["engine"]
     ext = "wav" if engine_finished == "Gemini TTS (신규)" else "mp3"
     mime = "audio/wav" if engine_finished == "Gemini TTS (신규)" else "audio/mp3"
 
     if engine_finished == "Gemini TTS (신규)":
-        merged = merge_wavs(parts)
+        merged = merge_wavs(valid_parts)
     else:
-        merged = b"".join(parts)
+        merged = b"".join(valid_parts)
 
-    st.success(f"✅ 생성 완료 · {total}개 청크 · 총 {len(merged):,} 바이트")
+    summary = f"✅ 생성 완료 · {len(valid_parts)}/{total}개 청크"
+    if skipped:
+        summary += f" ({skipped}개 건너뜀)"
+    summary += f" · 총 {len(merged):,} 바이트"
+    st.success(summary)
     st.audio(merged, format=mime)
 
     if save_mode == "하나의 파일로 합치기":
@@ -498,6 +519,8 @@ if job and job["status"] == "done":
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, part in enumerate(parts, 1):
+                if part is None:
+                    continue
                 zf.writestr(f"tts_part_{i:03d}.{ext}", part)
         buf.seek(0)
         st.download_button(

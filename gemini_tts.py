@@ -74,6 +74,11 @@ class OutputOverflow(RuntimeError):
     pass
 
 
+class ServerError(RuntimeError):
+    """5xx가 재시도 후에도 계속 발생 — 분할-재시도 시도 대상."""
+    pass
+
+
 def _is_quota_error(status_code: int, body_text: str) -> bool:
     if status_code == 429:
         return True
@@ -172,7 +177,7 @@ def synthesize_gemini(
         if _is_quota_error(resp.status_code, resp.text):
             raise QuotaExceeded(f"할당량 초과 ({resp.status_code}): {resp.text}")
         if resp.status_code in TRANSIENT_CODES:
-            raise RuntimeError(
+            raise ServerError(
                 f"Gemini TTS 서버 부하 지속 ({resp.status_code}, {MAX_ATTEMPTS}회 재시도 후에도 실패). "
                 f"잠시 후 다시 시도해 보세요.\n{resp.text[:300]}"
             )
@@ -297,7 +302,7 @@ def synthesize_gemini_chunk(
     try:
         wav, offset = _call_with_rotation(remaining_keys, _try, on_rotate=rotate_cb)
         return [wav], start_key_idx + offset
-    except OutputOverflow:
+    except (OutputOverflow, ServerError):
         if _depth >= 4 or len(chunk_text) <= 1:
             raise
         sub_chunks = _split_for_retry(chunk_text)
