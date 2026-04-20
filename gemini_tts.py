@@ -69,6 +69,11 @@ class QuotaExceeded(RuntimeError):
     pass
 
 
+class OutputOverflow(RuntimeError):
+    """finishReason=OTHER/MAX_TOKENS — 청크를 더 작게 쪼개서 재시도 가능."""
+    pass
+
+
 def _is_quota_error(status_code: int, body_text: str) -> bool:
     if status_code == 429:
         return True
@@ -177,9 +182,10 @@ def synthesize_gemini(
             "BLOCKLIST": "차단 목록에 걸림",
         }
         hint = hints.get(finish_reason, "원인 불명")
-        raise RuntimeError(
-            f"Gemini가 오디오를 반환하지 않음 (finishReason={finish_reason}): {hint}"
-        )
+        msg = f"Gemini가 오디오를 반환하지 않음 (finishReason={finish_reason}): {hint}"
+        if finish_reason in ("OTHER", "MAX_TOKENS"):
+            raise OutputOverflow(msg)
+        raise RuntimeError(msg)
     try:
         inline = parts[0]["inlineData"]
     except (KeyError, TypeError):
@@ -230,10 +236,11 @@ def synthesize_gemini_long(
     rate = 24000
     current_idx = 0
 
-    for i, chunk in enumerate(chunks):
+    def _synthesize_one(chunk_text, depth=0):
+        nonlocal current_idx
         remaining_keys = api_keys[current_idx:]
 
-        def _try(k, c=chunk):
+        def _try(k, c=chunk_text):
             return synthesize_gemini(
                 k, c, model, voice_name, style_prompt,
                 seed=seed, temperature=temperature,
@@ -241,18 +248,58 @@ def synthesize_gemini_long(
 
         try:
             wav, offset = _call_with_rotation(remaining_keys, _try, on_rotate=rotate_cb)
+        except OutputOverflow:
+            if depth >= 4 or len(chunk_text) <= 1:
+                raise
+            sub_chunks = _split_for_retry(chunk_text)
+            if len(sub_chunks) < 2:
+                raise
+            wavs = []
+            for sub in sub_chunks:
+                sub_wav = _synthesize_one(sub, depth=depth + 1)
+                wavs.append(sub_wav)
+            return wavs
+        current_idx += offset
+        return wav
+
+    def _flatten(wavs_or_wav):
+        if isinstance(wavs_or_wav, list):
+            out = []
+            for w in wavs_or_wav:
+                out.extend(_flatten(w))
+            return out
+        return [wavs_or_wav]
+
+    for i, chunk in enumerate(chunks):
+        try:
+            result = _synthesize_one(chunk)
         except QuotaExceeded as e:
             raise QuotaExceeded(
                 f"모든 API 키의 할당량이 소진되었습니다 ({len(api_keys)}개 모두 실패). "
                 f"백업 키를 추가하거나 내일까지 기다리세요. 마지막 응답: {e}"
             ) from e
-        current_idx += offset
 
-        pcm, rate = _wav_to_pcm(wav)
-        pcm_parts.append(pcm)
-        wav_parts.append(wav)
+        for wav in _flatten(result):
+            pcm, rate = _wav_to_pcm(wav)
+            pcm_parts.append(pcm)
+            wav_parts.append(wav)
         if progress_cb:
             progress_cb(i + 1, len(chunks), current_idx + 1)
 
     merged = _pcm_to_wav(b"".join(pcm_parts), rate=rate)
     return merged, wav_parts
+
+
+def _split_for_retry(text: str) -> list:
+    """OutputOverflow 발생 청크를 문단/문장/반 기준으로 2개 이상으로 쪼갠다."""
+    if "\n\n" in text:
+        parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        if len(parts) >= 2:
+            mid = len(parts) // 2
+            return ["\n\n".join(parts[:mid]), "\n\n".join(parts[mid:])]
+    sentences = [s for s in re.split(r"(?<=[.!?。！？])\s+", text) if s.strip()]
+    if len(sentences) >= 2:
+        mid = len(sentences) // 2
+        return [" ".join(sentences[:mid]).strip(), " ".join(sentences[mid:]).strip()]
+    mid = len(text) // 2
+    return [text[:mid].strip(), text[mid:].strip()]
