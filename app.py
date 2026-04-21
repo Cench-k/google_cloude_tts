@@ -13,7 +13,7 @@ from gemini_tts import (
     synthesize_gemini,
     synthesize_gemini_chunk,
 )
-from tts_utils import list_voices, split_text, synthesize, synthesize_long
+from tts_utils import list_voices, split_text, synthesize
 
 st.set_page_config(page_title="Google TTS 도우미", page_icon="🔊", layout="wide")
 st.title("🔊 Google TTS 도우미")
@@ -305,36 +305,25 @@ if text:
         f"📝 총 {len(text):,}자 · {text_bytes:,} bytes · "
         f"{len(chunks_preview)}개 청크로 분할 예정 ({limit_hint})"
     )
-    with st.expander("🔍 청크 경계 확인 (각 청크 끝 40자 미리보기)"):
-        for i, chunk in enumerate(chunks_preview, 1):
-            chunk_bytes = len(chunk.encode("utf-8"))
-            tail = chunk[-40:].replace("\n", "↵")
-            ends_on_break = chunk.rstrip().endswith((".", "!", "?", "。", "！", "？"))
-            mark = "✅" if ends_on_break else "⚠️"
-            st.write(
-                f"{mark} **청크 {i}** ({chunk_bytes:,}B) "
-                f"··· `{tail}`"
-            )
 
-col1, col2 = st.columns(2)
-with col1:
-    preview_btn = st.button(
-        "🎧 미리듣기 (앞 200자)",
-        use_container_width=True,
-        disabled=not text,
-    )
-with col2:
-    generate_btn = st.button(
-        "🎵 전체 생성",
-        type="primary",
-        use_container_width=True,
-        disabled=not text,
-    )
+    chunks_key = f"{engine}|{hash(tuple(chunks_preview))}"
+    if st.session_state.get("chunks_key") != chunks_key:
+        st.session_state.chunks_key = chunks_key
+        st.session_state.chunk_audios = {}
+        st.session_state.chunk_errors = {}
+        st.session_state.gemini_key_idx = 0
 
-save_mode = st.radio(
-    "저장 방식",
-    ["하나의 파일로 합치기", "청크별 개별 파일 (ZIP)"],
-    horizontal=True,
+    if "chunk_audios" not in st.session_state:
+        st.session_state.chunk_audios = {}
+    if "chunk_errors" not in st.session_state:
+        st.session_state.chunk_errors = {}
+    if "gemini_key_idx" not in st.session_state:
+        st.session_state.gemini_key_idx = 0
+
+preview_btn = st.button(
+    "🎧 미리듣기 (앞 200자)",
+    use_container_width=True,
+    disabled=not text,
 )
 
 
@@ -365,172 +354,124 @@ if preview_btn and text:
         except Exception as e:
             st.error(f"생성 실패: {e}")
 
-if "tts_job" not in st.session_state:
-    st.session_state.tts_job = None
+if text and chunks_preview:
+    st.divider()
+    total_chunks = len(chunks_preview)
+    done_count = sum(1 for i in range(total_chunks) if i in st.session_state.chunk_audios)
 
-if generate_btn and text:
-    if engine == "Gemini TTS (신규)":
-        job_chunks = split_text(text, max_bytes=get_max_bytes(model))
-    else:
-        job_chunks = split_text(text, max_sentence_bytes=max_sentence_bytes)
+    st.subheader(f"🎙️ 청크별 생성 ({done_count}/{total_chunks} 완료)")
 
-    if not job_chunks:
-        st.error("입력 텍스트가 비어 있습니다.")
-    else:
-        st.session_state.tts_job = {
-            "engine": engine,
-            "chunks": job_chunks,
-            "done_parts": [],
-            "key_idx": 0,
-            "rotation_events": [],
-            "params": {
-                "model": model,
-                "voice_name": voice_name,
-                "style_prompt": style_prompt,
-                "seed": seed_value,
-                "temperature": temperature_value,
-                "keys": gemini_key_pool if engine == "Gemini TTS (신규)" else [active_key],
-                "language_code": language_code,
-                "speaking_rate": speaking_rate,
-                "pitch": pitch,
-            },
-            "status": "running",
-            "error": None,
-        }
-        st.rerun()
+    ext = _audio_ext()
+    mime = _audio_mime()
 
-job = st.session_state.tts_job
-
-if job and job["status"] in ("running", "error"):
-    total = len(job["chunks"])
-    done = len(job["done_parts"])
-    progress = st.progress(done / total if total else 0,
-                           f"{done}/{total} 청크 완료 · 다음 청크 처리 중...")
-    if job["rotation_events"]:
-        st.warning("\n".join(job["rotation_events"]))
-
-    col_cancel, col_retry, col_skip = st.columns(3)
-    with col_cancel:
-        if st.button("❌ 생성 취소", use_container_width=True):
-            st.session_state.tts_job = None
-            st.rerun()
-    with col_retry:
-        if job["status"] == "error" and st.button("🔁 이어서 재시도", use_container_width=True, type="primary"):
-            job["status"] = "running"
-            job["error"] = None
-            st.session_state.tts_job = job
-            st.rerun()
-    with col_skip:
-        if job["status"] == "error" and st.button("⏭️ 이 청크 건너뛰기", use_container_width=True):
-            job["done_parts"].append(None)
-            job["status"] = "running" if len(job["done_parts"]) < total else "done"
-            job["error"] = None
-            st.session_state.tts_job = job
-            st.rerun()
-
-    if job["status"] == "error":
-        failing_chunk = job["chunks"][done]
-        st.error(f"청크 {done + 1} 실패: {job['error']}")
-        with st.expander(f"📄 실패한 청크 {done + 1} 본문 ({len(failing_chunk.encode('utf-8')):,} bytes)"):
-            st.text(failing_chunk)
-            st.caption(
-                "💡 5xx가 계속 발생하면 이 청크에 구글 모델이 민감하게 반응하는 "
-                "특정 문자열이 있을 가능성. 건너뛰고 결과 확인 후 해당 부분만 "
-                "따로 편집해서 재생성하는 방법도 있습니다."
+    if done_count == total_chunks and total_chunks > 0:
+        all_parts = [st.session_state.chunk_audios[i] for i in range(total_chunks)]
+        if engine == "Gemini TTS (신규)":
+            merged = merge_wavs(all_parts)
+        else:
+            merged = b"".join(all_parts)
+        st.success(f"🎉 모든 청크 완료 · 총 {len(merged):,} 바이트")
+        st.audio(merged, format=mime)
+        col_all, col_zip = st.columns(2)
+        with col_all:
+            st.download_button(
+                f"💾 전체 {ext.upper()} (하나로 합치기)",
+                merged,
+                file_name=f"tts_output.{ext}",
+                mime=mime,
+                use_container_width=True,
+                key="dl_merged",
             )
-    else:
-        chunk = job["chunks"][done]
-        params = job["params"]
-
-        def _on_rotate(old_i, new_i, err_msg):
-            job["rotation_events"].append(
-                f"⚠️ 키 #{old_i + 1} 할당량 초과 → 키 #{new_i + 1}로 전환"
+        with col_zip:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i, part in enumerate(all_parts, 1):
+                    zf.writestr(f"tts_part_{i:03d}.{ext}", part)
+            buf.seek(0)
+            st.download_button(
+                "📦 ZIP (청크별 파일)",
+                buf,
+                file_name="tts_output.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="dl_zip",
             )
 
-        try:
-            if job["engine"] == "Gemini TTS (신규)":
-                wavs, new_idx = synthesize_gemini_chunk(
-                    params["keys"], job["key_idx"], chunk,
-                    params["model"], params["voice_name"],
-                    style_prompt=params["style_prompt"],
-                    seed=params["seed"], temperature=params["temperature"],
-                    rotate_cb=_on_rotate,
+    if done_count > 0:
+        if st.button("🗑️ 전체 초기화 (다시 생성)", use_container_width=True):
+            st.session_state.chunk_audios = {}
+            st.session_state.chunk_errors = {}
+            st.session_state.gemini_key_idx = 0
+            st.rerun()
+
+    st.caption(f"🔑 현재 사용 중인 Gemini 키: #{st.session_state.gemini_key_idx + 1}")
+
+    for i, chunk in enumerate(chunks_preview):
+        chunk_bytes = len(chunk.encode("utf-8"))
+        preview_text = chunk[:40].replace("\n", " ")
+        if len(chunk) > 40:
+            preview_text += "…"
+
+        is_done = i in st.session_state.chunk_audios
+        has_error = i in st.session_state.chunk_errors
+        icon = "✅" if is_done else ("❌" if has_error else "⏳")
+
+        col_info, col_action = st.columns([4, 1])
+        with col_info:
+            st.markdown(
+                f"**{icon} 청크 {i + 1}/{total_chunks}** · "
+                f"{chunk_bytes:,}B · `{preview_text}`"
+            )
+            if has_error and not is_done:
+                st.error(st.session_state.chunk_errors[i])
+            with st.expander("📄 본문 보기"):
+                st.text(chunk)
+        with col_action:
+            if is_done:
+                st.download_button(
+                    f"💾 다운로드",
+                    st.session_state.chunk_audios[i],
+                    file_name=f"tts_part_{i + 1:03d}.{ext}",
+                    mime=mime,
+                    key=f"dl_{i}",
+                    use_container_width=True,
                 )
-                job["key_idx"] = new_idx
-                merged_chunk = merge_wavs(wavs)
-                job["done_parts"].append(merged_chunk)
+                if st.button("🔄 재생성", key=f"regen_{i}", use_container_width=True):
+                    del st.session_state.chunk_audios[i]
+                    st.session_state.chunk_errors.pop(i, None)
+                    st.rerun()
             else:
-                audio = synthesize(
-                    params["keys"][0], chunk, params["voice_name"],
-                    language_code=params["language_code"],
-                    speaking_rate=params["speaking_rate"], pitch=params["pitch"],
-                )
-                job["done_parts"].append(audio)
-
-            if len(job["done_parts"]) >= total:
-                job["status"] = "done"
-            st.session_state.tts_job = job
-            st.rerun()
-        except QuotaExceeded as e:
-            job["status"] = "error"
-            job["error"] = (
-                "🚫 모든 API 키의 할당량이 소진되었습니다. "
-                "사이드바에 백업 키를 추가하거나 내일 다시 시도하세요.\n\n"
-                f"{e}"
-            )
-            st.session_state.tts_job = job
-            st.rerun()
-        except Exception as e:
-            job["status"] = "error"
-            job["error"] = str(e)
-            st.session_state.tts_job = job
-            st.rerun()
-
-if job and job["status"] == "done":
-    total = len(job["chunks"])
-    parts = job["done_parts"]
-    valid_parts = [p for p in parts if p is not None]
-    skipped = total - len(valid_parts)
-    engine_finished = job["engine"]
-    ext = "wav" if engine_finished == "Gemini TTS (신규)" else "mp3"
-    mime = "audio/wav" if engine_finished == "Gemini TTS (신규)" else "audio/mp3"
-
-    if engine_finished == "Gemini TTS (신규)":
-        merged = merge_wavs(valid_parts)
-    else:
-        merged = b"".join(valid_parts)
-
-    summary = f"✅ 생성 완료 · {len(valid_parts)}/{total}개 청크"
-    if skipped:
-        summary += f" ({skipped}개 건너뜀)"
-    summary += f" · 총 {len(merged):,} 바이트"
-    st.success(summary)
-    st.audio(merged, format=mime)
-
-    if save_mode == "하나의 파일로 합치기":
-        st.download_button(
-            f"💾 {ext.upper()} 다운로드",
-            merged,
-            file_name=f"tts_output.{ext}",
-            mime=mime,
-            use_container_width=True,
-        )
-    else:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, part in enumerate(parts, 1):
-                if part is None:
-                    continue
-                zf.writestr(f"tts_part_{i:03d}.{ext}", part)
-        buf.seek(0)
-        st.download_button(
-            "💾 ZIP 다운로드",
-            buf,
-            file_name="tts_output.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
-
-    if st.button("🗑️ 결과 지우고 새로 시작", use_container_width=True):
-        st.session_state.tts_job = None
-        st.rerun()
+                btn_label = "🔁 재시도" if has_error else "▶ 생성"
+                btn_type = "secondary" if has_error else "primary"
+                if st.button(btn_label, key=f"gen_{i}", type=btn_type, use_container_width=True):
+                    with st.spinner(f"청크 {i + 1} 생성 중..."):
+                        try:
+                            if engine == "Gemini TTS (신규)":
+                                wavs, new_idx = synthesize_gemini_chunk(
+                                    gemini_key_pool,
+                                    st.session_state.gemini_key_idx,
+                                    chunk, model, voice_name,
+                                    style_prompt=style_prompt,
+                                    seed=seed_value,
+                                    temperature=temperature_value,
+                                )
+                                st.session_state.gemini_key_idx = new_idx
+                                audio_bytes = merge_wavs(wavs)
+                            else:
+                                audio_bytes = synthesize(
+                                    active_key, chunk, voice_name,
+                                    language_code=language_code,
+                                    speaking_rate=speaking_rate, pitch=pitch,
+                                )
+                            st.session_state.chunk_audios[i] = audio_bytes
+                            st.session_state.chunk_errors.pop(i, None)
+                            st.rerun()
+                        except QuotaExceeded as e:
+                            st.session_state.chunk_errors[i] = (
+                                f"🚫 모든 API 키의 할당량이 소진되었습니다. "
+                                f"사이드바에 백업 키를 추가하거나 내일 다시 시도하세요.\n\n{e}"
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.session_state.chunk_errors[i] = str(e)
+                            st.rerun()
