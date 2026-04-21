@@ -1,5 +1,7 @@
 import io
+import time
 import zipfile
+from datetime import datetime
 
 import streamlit as st
 
@@ -312,6 +314,7 @@ if text:
         st.session_state.chunk_audios = {}
         st.session_state.chunk_errors = {}
         st.session_state.gemini_key_idx = 0
+        st.session_state.call_log = []
 
     if "chunk_audios" not in st.session_state:
         st.session_state.chunk_audios = {}
@@ -319,6 +322,8 @@ if text:
         st.session_state.chunk_errors = {}
     if "gemini_key_idx" not in st.session_state:
         st.session_state.gemini_key_idx = 0
+    if "call_log" not in st.session_state:
+        st.session_state.call_log = []
 
 preview_btn = st.button(
     "🎧 미리듣기 (앞 200자)",
@@ -406,6 +411,30 @@ if text and chunks_preview:
 
     st.caption(f"🔑 현재 사용 중인 Gemini 키: #{st.session_state.gemini_key_idx + 1}")
 
+    log = st.session_state.call_log
+    with st.expander(f"📡 모델 호출 로그 ({len(log)}회)", expanded=False):
+        if not log:
+            st.caption("아직 호출 기록이 없습니다.")
+        else:
+            col_clear, _ = st.columns([1, 3])
+            with col_clear:
+                if st.button("🗑️ 로그 지우기", key="clear_log"):
+                    st.session_state.call_log = []
+                    st.rerun()
+            for entry in reversed(log):
+                status_icon = "✅" if entry["status"] == "성공" else "❌"
+                line = (
+                    f"{status_icon} `{entry['time']}` · 청크 {entry['chunk']} · "
+                    f"키 #{entry['key']} · {entry['duration']:.1f}s · {entry['status']}"
+                )
+                if entry.get("error"):
+                    line += f" — {entry['error'][:80]}"
+                st.markdown(line)
+
+    last_call_by_chunk = {}
+    for entry in log:
+        last_call_by_chunk[entry["chunk"]] = entry
+
     for i, chunk in enumerate(chunks_preview):
         chunk_bytes = len(chunk.encode("utf-8"))
         preview_text = chunk[:40].replace("\n", " ")
@@ -422,6 +451,12 @@ if text and chunks_preview:
                 f"**{icon} 청크 {i + 1}/{total_chunks}** · "
                 f"{chunk_bytes:,}B · `{preview_text}`"
             )
+            last = last_call_by_chunk.get(i + 1)
+            if last:
+                st.caption(
+                    f"📡 마지막 호출: {last['time']} · 키 #{last['key']} · "
+                    f"{last['duration']:.1f}s · {last['status']}"
+                )
             if has_error and not is_done:
                 st.error(st.session_state.chunk_errors[i])
             with st.expander("📄 본문 보기"):
@@ -444,6 +479,9 @@ if text and chunks_preview:
                 btn_label = "🔁 재시도" if has_error else "▶ 생성"
                 btn_type = "secondary" if has_error else "primary"
                 if st.button(btn_label, key=f"gen_{i}", type=btn_type, use_container_width=True):
+                    start_key = st.session_state.gemini_key_idx
+                    started_at = time.monotonic()
+                    ts = datetime.now().strftime("%H:%M:%S")
                     with st.spinner(f"청크 {i + 1} 생성 중..."):
                         try:
                             if engine == "Gemini TTS (신규)":
@@ -457,21 +495,47 @@ if text and chunks_preview:
                                 )
                                 st.session_state.gemini_key_idx = new_idx
                                 audio_bytes = merge_wavs(wavs)
+                                used_key = new_idx + 1
                             else:
                                 audio_bytes = synthesize(
                                     active_key, chunk, voice_name,
                                     language_code=language_code,
                                     speaking_rate=speaking_rate, pitch=pitch,
                                 )
+                                used_key = 1
                             st.session_state.chunk_audios[i] = audio_bytes
                             st.session_state.chunk_errors.pop(i, None)
+                            st.session_state.call_log.append({
+                                "time": ts,
+                                "chunk": i + 1,
+                                "key": used_key,
+                                "duration": time.monotonic() - started_at,
+                                "status": "성공",
+                                "error": None,
+                            })
                             st.rerun()
                         except QuotaExceeded as e:
                             st.session_state.chunk_errors[i] = (
                                 f"🚫 모든 API 키의 할당량이 소진되었습니다. "
                                 f"사이드바에 백업 키를 추가하거나 내일 다시 시도하세요.\n\n{e}"
                             )
+                            st.session_state.call_log.append({
+                                "time": ts,
+                                "chunk": i + 1,
+                                "key": start_key + 1,
+                                "duration": time.monotonic() - started_at,
+                                "status": "할당량 초과",
+                                "error": str(e),
+                            })
                             st.rerun()
                         except Exception as e:
                             st.session_state.chunk_errors[i] = str(e)
+                            st.session_state.call_log.append({
+                                "time": ts,
+                                "chunk": i + 1,
+                                "key": start_key + 1,
+                                "duration": time.monotonic() - started_at,
+                                "status": "실패",
+                                "error": str(e),
+                            })
                             st.rerun()
