@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import re
 import wave
 
@@ -8,7 +9,7 @@ import requests
 from tts_utils import split_text
 
 GEMINI_ENDPOINT = (
-    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent"
 )
 
 GEMINI_MODELS = [
@@ -50,7 +51,8 @@ GEMINI_VOICES = [
     ("Sulafat", "Warm 따뜻"),
 ]
 
-GEMINI_TIMEOUT = 300
+GEMINI_CONNECT_TIMEOUT = 30
+GEMINI_READ_TIMEOUT = 120
 
 MODEL_MAX_BYTES = {
     "gemini-3.1-flash-tts-preview": 1500,
@@ -145,32 +147,85 @@ def synthesize_gemini(
     try:
         resp = requests.post(
             url,
-            params={"key": api_key},
+            params={"key": api_key, "alt": "sse"},
             json=body,
-            timeout=GEMINI_TIMEOUT,
+            timeout=(GEMINI_CONNECT_TIMEOUT, GEMINI_READ_TIMEOUT),
+            stream=True,
         )
     except requests.exceptions.ReadTimeout as e:
         raise RuntimeError(
-            f"Gemini TTS 응답 지연 (타임아웃 {GEMINI_TIMEOUT}s). 잠시 후 다시 시도해 보세요."
+            f"Gemini TTS 연결 지연 ({GEMINI_CONNECT_TIMEOUT}s). 잠시 후 다시 시도해 보세요."
         ) from e
 
     if resp.status_code != 200:
-        if _is_quota_error(resp.status_code, resp.text):
-            raise QuotaExceeded(f"할당량 초과 ({resp.status_code}): {resp.text}")
+        body_text = resp.text
+        if _is_quota_error(resp.status_code, body_text):
+            raise QuotaExceeded(f"할당량 초과 ({resp.status_code}): {body_text}")
         if resp.status_code in TRANSIENT_CODES:
             raise ServerError(
                 f"Gemini TTS 서버 오류 ({resp.status_code}). 구글 서버 문제입니다. "
-                f"잠시 후 '이어서 재시도' 버튼으로 수동 재시도하세요.\n{resp.text[:300]}"
+                f"잠시 후 '이어서 재시도' 버튼으로 수동 재시도하세요.\n{body_text[:300]}"
             )
-        raise RuntimeError(f"Gemini TTS API 오류 ({resp.status_code}): {resp.text}")
-    data = resp.json()
+        raise RuntimeError(f"Gemini TTS API 오류 ({resp.status_code}): {body_text}")
+
+    pcm_parts = []
+    rate = 24000
+    finish_reason = "UNKNOWN"
+    last_error_msg = None
+
     try:
-        candidate = data["candidates"][0]
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Gemini 응답에 candidate 없음: {data}")
-    parts = candidate.get("content", {}).get("parts", [])
-    finish_reason = candidate.get("finishReason", "UNKNOWN")
-    if not parts:
+        for raw_line in resp.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if "error" in event:
+                err = event["error"]
+                last_error_msg = err.get("message", json.dumps(err))
+                code = err.get("code", 0)
+                if _is_quota_error(code, last_error_msg):
+                    raise QuotaExceeded(f"할당량 초과 ({code}): {last_error_msg}")
+                if code in TRANSIENT_CODES:
+                    raise ServerError(f"Gemini TTS 서버 오류 ({code}): {last_error_msg}")
+                continue
+            candidates = event.get("candidates", [])
+            if not candidates:
+                continue
+            cand = candidates[0]
+            for part in cand.get("content", {}).get("parts", []):
+                inline = part.get("inlineData")
+                if not inline or "data" not in inline:
+                    continue
+                pcm_parts.append(base64.b64decode(inline["data"]))
+                mime = inline.get("mimeType", "")
+                m = re.search(r"rate=(\d+)", mime)
+                if m:
+                    rate = int(m.group(1))
+            fr = cand.get("finishReason")
+            if fr:
+                finish_reason = fr
+    except requests.exceptions.ReadTimeout as e:
+        if pcm_parts:
+            raise RuntimeError(
+                f"Gemini TTS 스트림 중단 (마지막 청크 수신 후 {GEMINI_READ_TIMEOUT}s 무응답). "
+                f"부분 오디오는 폐기됨. 다시 시도하세요."
+            ) from e
+        raise RuntimeError(
+            f"Gemini TTS 응답 지연 (첫 오디오 청크 대기 {GEMINI_READ_TIMEOUT}s). "
+            f"서버가 과부하 상태일 수 있습니다. 잠시 후 재시도."
+        ) from e
+    finally:
+        resp.close()
+
+    if not pcm_parts:
         hints = {
             "OTHER": "출력 길이 초과 가능성 — 청크 크기를 줄여보세요",
             "MAX_TOKENS": "모델 출력 토큰 한도 초과 — 청크 크기 축소 필요",
@@ -179,20 +234,13 @@ def synthesize_gemini(
             "PROHIBITED_CONTENT": "금지된 콘텐츠",
             "BLOCKLIST": "차단 목록에 걸림",
         }
-        hint = hints.get(finish_reason, "원인 불명")
+        hint = hints.get(finish_reason, last_error_msg or "원인 불명")
         msg = f"Gemini가 오디오를 반환하지 않음 (finishReason={finish_reason}): {hint}"
         if finish_reason in ("OTHER", "MAX_TOKENS"):
             raise OutputOverflow(msg)
         raise RuntimeError(msg)
-    try:
-        inline = parts[0]["inlineData"]
-    except (KeyError, TypeError):
-        raise RuntimeError(f"응답 parts에 inlineData 없음: {parts[0]}")
-    pcm = base64.b64decode(inline["data"])
-    mime = inline.get("mimeType", "")
-    m = re.search(r"rate=(\d+)", mime)
-    rate = int(m.group(1)) if m else 24000
-    return _pcm_to_wav(pcm, rate=rate)
+
+    return _pcm_to_wav(b"".join(pcm_parts), rate=rate)
 
 
 def _call_with_rotation(keys, fn, on_rotate=None):
