@@ -434,12 +434,17 @@ if text and chunks_preview:
                     st.rerun()
             for entry in reversed(log):
                 status_icon = "✅" if entry["status"] == "성공" else "❌"
+                ttfb = entry.get("ttfb")
+                ttfb_str = f"{ttfb:.1f}s" if ttfb is not None else "없음"
                 line = (
                     f"{status_icon} `{entry['time']}` · 청크 {entry['chunk']} · "
-                    f"키 #{entry['key']} · {entry['duration']:.1f}s · {entry['status']}"
+                    f"키 #{entry['key']} · {entry['duration']:.1f}s · "
+                    f"TTFB {ttfb_str} · {entry.get('events', 0)}이벤트 · "
+                    f"{entry.get('pcm_bytes', 0):,}B · "
+                    f"finish={entry.get('finish_reason') or '?'} · {entry['status']}"
                 )
                 if entry.get("error"):
-                    line += f" — {entry['error'][:80]}"
+                    line += f"\n  — {entry['error'][:200]}"
                 st.markdown(line)
 
     last_call_by_chunk = {}
@@ -464,9 +469,13 @@ if text and chunks_preview:
             )
             last = last_call_by_chunk.get(i + 1)
             if last:
+                ttfb = last.get("ttfb")
+                ttfb_str = f"{ttfb:.1f}s" if ttfb is not None else "없음"
                 st.caption(
                     f"📡 마지막 호출: {last['time']} · 키 #{last['key']} · "
-                    f"{last['duration']:.1f}s · {last['status']}"
+                    f"{last['duration']:.1f}s · TTFB {ttfb_str} · "
+                    f"{last.get('events', 0)}이벤트 · "
+                    f"{last.get('pcm_bytes', 0):,}B · {last['status']}"
                 )
             if has_error and not is_done:
                 st.error(st.session_state.chunk_errors[i])
@@ -493,6 +502,7 @@ if text and chunks_preview:
                     start_key = st.session_state.gemini_key_idx
                     started_at = time.monotonic()
                     ts = datetime.now().strftime("%H:%M:%S")
+                    call_stats = {}
                     with st.spinner(f"청크 {i + 1} 생성 중..."):
                         try:
                             if engine == "Gemini TTS (신규)":
@@ -503,6 +513,7 @@ if text and chunks_preview:
                                     style_prompt=style_prompt,
                                     seed=seed_value,
                                     temperature=temperature_value,
+                                    stats=call_stats,
                                 )
                                 st.session_state.gemini_key_idx = new_idx
                                 audio_bytes = merge_wavs(wavs)
@@ -523,6 +534,10 @@ if text and chunks_preview:
                                 "duration": time.monotonic() - started_at,
                                 "status": "성공",
                                 "error": None,
+                                "ttfb": call_stats.get("ttfb"),
+                                "events": call_stats.get("events", 0),
+                                "pcm_bytes": call_stats.get("pcm_bytes", 0),
+                                "finish_reason": call_stats.get("finish_reason"),
                             })
                             st.rerun()
                         except QuotaExceeded as e:
@@ -537,6 +552,10 @@ if text and chunks_preview:
                                 "duration": time.monotonic() - started_at,
                                 "status": "할당량 초과",
                                 "error": str(e),
+                                "ttfb": call_stats.get("ttfb"),
+                                "events": call_stats.get("events", 0),
+                                "pcm_bytes": call_stats.get("pcm_bytes", 0),
+                                "finish_reason": call_stats.get("finish_reason"),
                             })
                             st.rerun()
                         except Exception as e:
@@ -548,5 +567,9 @@ if text and chunks_preview:
                                 "duration": time.monotonic() - started_at,
                                 "status": "실패",
                                 "error": str(e),
+                                "ttfb": call_stats.get("ttfb"),
+                                "events": call_stats.get("events", 0),
+                                "pcm_bytes": call_stats.get("pcm_bytes", 0),
+                                "finish_reason": call_stats.get("finish_reason"),
                             })
                             st.rerun()

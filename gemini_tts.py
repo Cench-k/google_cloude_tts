@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import re
+import time
 import wave
 
 import requests
@@ -129,6 +130,7 @@ def synthesize_gemini(
     style_prompt: str = "",
     seed: int = None,
     temperature: float = None,
+    stats: dict = None,
 ) -> bytes:
     content_text = f"Say {style_prompt}: {text}" if style_prompt.strip() else text
     generation_config = {
@@ -181,6 +183,17 @@ def synthesize_gemini(
     rate = 24000
     finish_reason = "UNKNOWN"
     last_error_msg = None
+    start_time = time.monotonic()
+    events_received = 0
+    first_byte_at = None
+    last_event_at = start_time
+
+    if stats is not None:
+        stats["events"] = 0
+        stats["pcm_bytes"] = 0
+        stats["ttfb"] = None
+        stats["finish_reason"] = "UNKNOWN"
+        stats["last_gap"] = 0.0
 
     try:
         for raw_line in resp.iter_lines(decode_unicode=True):
@@ -196,6 +209,14 @@ def synthesize_gemini(
                 event = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+
+            events_received += 1
+            now = time.monotonic()
+            if stats is not None:
+                stats["events"] = events_received
+                stats["last_gap"] = now - last_event_at
+            last_event_at = now
+
             if "error" in event:
                 err = event["error"]
                 last_error_msg = err.get("message", json.dumps(err))
@@ -213,7 +234,14 @@ def synthesize_gemini(
                 inline = part.get("inlineData")
                 if not inline or "data" not in inline:
                     continue
-                pcm_parts.append(base64.b64decode(inline["data"]))
+                decoded = base64.b64decode(inline["data"])
+                pcm_parts.append(decoded)
+                if first_byte_at is None:
+                    first_byte_at = now - start_time
+                    if stats is not None:
+                        stats["ttfb"] = first_byte_at
+                if stats is not None:
+                    stats["pcm_bytes"] = sum(len(p) for p in pcm_parts)
                 mime = inline.get("mimeType", "")
                 m = re.search(r"rate=(\d+)", mime)
                 if m:
@@ -221,19 +249,29 @@ def synthesize_gemini(
             fr = cand.get("finishReason")
             if fr:
                 finish_reason = fr
+                if stats is not None:
+                    stats["finish_reason"] = fr
     except (
         requests.exceptions.ReadTimeout,
         requests.exceptions.ChunkedEncodingError,
         requests.exceptions.ConnectionError,
     ) as e:
+        total_elapsed = time.monotonic() - start_time
+        total_bytes = sum(len(p) for p in pcm_parts)
+        ttfb_str = f"{first_byte_at:.1f}s" if first_byte_at is not None else "없음"
+        diag = (
+            f"TTFB={ttfb_str} · 이벤트={events_received}회 · "
+            f"수신={total_bytes:,}B · 경과={total_elapsed:.1f}s · "
+            f"finishReason={finish_reason}"
+        )
         if pcm_parts:
             raise NetworkError(
-                f"Gemini TTS 스트림 중단 (부분 수신 후 연결 끊김, read timeout {GEMINI_READ_TIMEOUT}s). "
-                f"부분 오디오는 폐기됨. 다시 시도하세요.\n원인: {e}"
+                f"Gemini TTS 스트림 중단 (부분 수신 후 {GEMINI_READ_TIMEOUT}s 무응답). "
+                f"[{diag}] 다시 시도하세요.\n원인: {e}"
             ) from e
         raise NetworkError(
-            f"Gemini TTS 응답 지연 (첫 오디오 청크 대기 중 {GEMINI_READ_TIMEOUT}s 내 데이터 없음). "
-            f"서버가 과부하 상태일 수 있습니다. 잠시 후 재시도.\n원인: {e}"
+            f"Gemini TTS 응답 지연 (첫 바이트 대기 중 {GEMINI_READ_TIMEOUT}s 내 데이터 없음). "
+            f"[{diag}] 서버 과부하 가능. 잠시 후 재시도.\n원인: {e}"
         ) from e
     finally:
         resp.close()
@@ -330,6 +368,7 @@ def synthesize_gemini_chunk(
     seed: int = None,
     temperature: float = None,
     rotate_cb=None,
+    stats: dict = None,
     _depth: int = 0,
 ):
     """단일 청크를 처리. 키 로테이션 + OutputOverflow 자동 분할-재시도.
@@ -343,7 +382,7 @@ def synthesize_gemini_chunk(
     def _try(k):
         return synthesize_gemini(
             k, chunk_text, model, voice_name, style_prompt,
-            seed=seed, temperature=temperature,
+            seed=seed, temperature=temperature, stats=stats,
         )
 
     try:
@@ -361,7 +400,7 @@ def synthesize_gemini_chunk(
             sub_wavs, idx = synthesize_gemini_chunk(
                 api_keys, idx, sub, model, voice_name,
                 style_prompt=style_prompt, seed=seed, temperature=temperature,
-                rotate_cb=rotate_cb, _depth=_depth + 1,
+                rotate_cb=rotate_cb, stats=stats, _depth=_depth + 1,
             )
             all_wavs.extend(sub_wavs)
         return all_wavs, idx
