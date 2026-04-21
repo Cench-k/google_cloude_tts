@@ -80,6 +80,11 @@ class ServerError(RuntimeError):
     pass
 
 
+class NetworkError(RuntimeError):
+    """연결 실패 / 타임아웃 / 스트림 중단 — 다른 키로 회전하면 통할 수 있음."""
+    pass
+
+
 def _is_quota_error(status_code: int, body_text: str) -> bool:
     if status_code == 429:
         return True
@@ -153,11 +158,11 @@ def synthesize_gemini(
             stream=True,
         )
     except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
-        raise RuntimeError(
+        raise NetworkError(
             f"Gemini TTS 연결 지연 ({GEMINI_CONNECT_TIMEOUT}s). 잠시 후 다시 시도해 보세요."
         ) from e
     except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(
+        raise NetworkError(
             f"Gemini TTS 연결 실패: {e}"
         ) from e
 
@@ -222,11 +227,11 @@ def synthesize_gemini(
         requests.exceptions.ConnectionError,
     ) as e:
         if pcm_parts:
-            raise RuntimeError(
+            raise NetworkError(
                 f"Gemini TTS 스트림 중단 (부분 수신 후 연결 끊김, read timeout {GEMINI_READ_TIMEOUT}s). "
                 f"부분 오디오는 폐기됨. 다시 시도하세요.\n원인: {e}"
             ) from e
-        raise RuntimeError(
+        raise NetworkError(
             f"Gemini TTS 응답 지연 (첫 오디오 청크 대기 중 {GEMINI_READ_TIMEOUT}s 내 데이터 없음). "
             f"서버가 과부하 상태일 수 있습니다. 잠시 후 재시도.\n원인: {e}"
         ) from e
@@ -256,10 +261,11 @@ def _call_with_rotation(keys, fn, on_rotate=None):
     for i, key in enumerate(keys):
         try:
             return fn(key), i
-        except QuotaExceeded as e:
+        except (QuotaExceeded, NetworkError) as e:
             last_err = e
             if on_rotate and i + 1 < len(keys):
-                on_rotate(i, i + 1, str(e))
+                reason = "할당량 초과" if isinstance(e, QuotaExceeded) else "네트워크 오류"
+                on_rotate(i, i + 1, f"{reason}: {e}")
             continue
     raise last_err or RuntimeError("사용 가능한 API 키가 없습니다.")
 
