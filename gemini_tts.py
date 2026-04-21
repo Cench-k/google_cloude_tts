@@ -52,7 +52,7 @@ GEMINI_VOICES = [
 ]
 
 GEMINI_CONNECT_TIMEOUT = 30
-GEMINI_READ_TIMEOUT = 120
+GEMINI_READ_TIMEOUT = 180
 
 MODEL_MAX_BYTES = {
     "gemini-3.1-flash-tts-preview": 1500,
@@ -152,9 +152,13 @@ def synthesize_gemini(
             timeout=(GEMINI_CONNECT_TIMEOUT, GEMINI_READ_TIMEOUT),
             stream=True,
         )
-    except requests.exceptions.ReadTimeout as e:
+    except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
         raise RuntimeError(
             f"Gemini TTS 연결 지연 ({GEMINI_CONNECT_TIMEOUT}s). 잠시 후 다시 시도해 보세요."
+        ) from e
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            f"Gemini TTS 연결 실패: {e}"
         ) from e
 
     if resp.status_code != 200:
@@ -212,15 +216,19 @@ def synthesize_gemini(
             fr = cand.get("finishReason")
             if fr:
                 finish_reason = fr
-    except requests.exceptions.ReadTimeout as e:
+    except (
+        requests.exceptions.ReadTimeout,
+        requests.exceptions.ChunkedEncodingError,
+        requests.exceptions.ConnectionError,
+    ) as e:
         if pcm_parts:
             raise RuntimeError(
-                f"Gemini TTS 스트림 중단 (마지막 청크 수신 후 {GEMINI_READ_TIMEOUT}s 무응답). "
-                f"부분 오디오는 폐기됨. 다시 시도하세요."
+                f"Gemini TTS 스트림 중단 (부분 수신 후 연결 끊김, read timeout {GEMINI_READ_TIMEOUT}s). "
+                f"부분 오디오는 폐기됨. 다시 시도하세요.\n원인: {e}"
             ) from e
         raise RuntimeError(
-            f"Gemini TTS 응답 지연 (첫 오디오 청크 대기 {GEMINI_READ_TIMEOUT}s). "
-            f"서버가 과부하 상태일 수 있습니다. 잠시 후 재시도."
+            f"Gemini TTS 응답 지연 (첫 오디오 청크 대기 중 {GEMINI_READ_TIMEOUT}s 내 데이터 없음). "
+            f"서버가 과부하 상태일 수 있습니다. 잠시 후 재시도.\n원인: {e}"
         ) from e
     finally:
         resp.close()
