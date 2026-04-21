@@ -334,6 +334,10 @@ def synthesize_gemini_chunk(
 ):
     """단일 청크를 처리. 키 로테이션 + OutputOverflow 자동 분할-재시도.
     Returns (list[wav_bytes], new_key_idx)."""
+    if not api_keys:
+        raise ValueError("API 키가 없습니다.")
+    if start_key_idx >= len(api_keys) or start_key_idx < 0:
+        start_key_idx = 0
     remaining_keys = api_keys[start_key_idx:]
 
     def _try(k):

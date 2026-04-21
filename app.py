@@ -316,6 +316,14 @@ if text:
         st.session_state.gemini_key_idx = 0
         st.session_state.call_log = []
 
+    if engine == "Gemini TTS (신규)":
+        pool_sig = "|".join(gemini_key_pool)
+    else:
+        pool_sig = f"CLOUD:{active_key}"
+    if st.session_state.get("pool_sig") != pool_sig:
+        st.session_state.pool_sig = pool_sig
+        st.session_state.gemini_key_idx = 0
+
     if "chunk_audios" not in st.session_state:
         st.session_state.chunk_audios = {}
     if "chunk_errors" not in st.session_state:
@@ -324,6 +332,9 @@ if text:
         st.session_state.gemini_key_idx = 0
     if "call_log" not in st.session_state:
         st.session_state.call_log = []
+
+    if engine == "Gemini TTS (신규)" and st.session_state.gemini_key_idx >= len(gemini_key_pool):
+        st.session_state.gemini_key_idx = 0
 
 preview_btn = st.button(
     "🎧 미리듣기 (앞 200자)",
