@@ -1,4 +1,5 @@
 import io
+import re
 import time
 import zipfile
 from datetime import datetime
@@ -308,6 +309,17 @@ if text:
         f"{len(chunks_preview)}개 청크로 분할 예정 ({limit_hint})"
     )
 
+    orig_chars = len(re.sub(r"\s+", "", text))
+    chunk_chars = sum(len(re.sub(r"\s+", "", c)) for c in chunks_preview)
+    if orig_chars > 0:
+        coverage = chunk_chars / orig_chars
+        if coverage < 0.99:
+            st.error(
+                f"⚠️ 청크 커버리지 {coverage * 100:.1f}% — 원문 대비 약 "
+                f"**{orig_chars - chunk_chars:,}자** 누락 감지. "
+                f"아래 '청크별 생성' 본문을 확인해 어떤 단락이 빠졌는지 점검하세요."
+            )
+
     chunks_key = f"{engine}|{hash(tuple(chunks_preview))}"
     if st.session_state.get("chunks_key") != chunks_key:
         st.session_state.chunks_key = chunks_key
@@ -332,6 +344,8 @@ if text:
         st.session_state.gemini_key_idx = 0
     if "call_log" not in st.session_state:
         st.session_state.call_log = []
+    if "batch_running" not in st.session_state:
+        st.session_state.batch_running = False
 
     if engine == "Gemini TTS (신규)" and st.session_state.gemini_key_idx >= len(gemini_key_pool):
         st.session_state.gemini_key_idx = 0
@@ -418,7 +432,90 @@ if text and chunks_preview:
             st.session_state.chunk_audios = {}
             st.session_state.chunk_errors = {}
             st.session_state.gemini_key_idx = 0
+            st.session_state.batch_running = False
             st.rerun()
+
+    def _generate_chunk(idx, chunk_text):
+        start_key = st.session_state.gemini_key_idx
+        started_at = time.monotonic()
+        ts = datetime.now().strftime("%H:%M:%S")
+        call_stats = {}
+        try:
+            if engine == "Gemini TTS (신규)":
+                wavs, new_idx = synthesize_gemini_chunk(
+                    gemini_key_pool,
+                    st.session_state.gemini_key_idx,
+                    chunk_text, model, voice_name,
+                    style_prompt=style_prompt,
+                    seed=seed_value,
+                    temperature=temperature_value,
+                    stats=call_stats,
+                )
+                st.session_state.gemini_key_idx = new_idx
+                audio_bytes = merge_wavs(wavs)
+                used_key = new_idx + 1
+            else:
+                audio_bytes = synthesize(
+                    active_key, chunk_text, voice_name,
+                    language_code=language_code,
+                    speaking_rate=speaking_rate, pitch=pitch,
+                )
+                used_key = 1
+            st.session_state.chunk_audios[idx] = audio_bytes
+            st.session_state.chunk_errors.pop(idx, None)
+            st.session_state.call_log.append({
+                "time": ts, "chunk": idx + 1, "key": used_key,
+                "duration": time.monotonic() - started_at,
+                "status": "성공", "error": None,
+                "ttfb": call_stats.get("ttfb"),
+                "events": call_stats.get("events", 0),
+                "pcm_bytes": call_stats.get("pcm_bytes", 0),
+                "finish_reason": call_stats.get("finish_reason"),
+            })
+            return True
+        except QuotaExceeded as e:
+            st.session_state.chunk_errors[idx] = (
+                f"🚫 모든 API 키의 할당량이 소진되었습니다. "
+                f"사이드바에 백업 키를 추가하거나 내일 다시 시도하세요.\n\n{e}"
+            )
+            st.session_state.call_log.append({
+                "time": ts, "chunk": idx + 1, "key": start_key + 1,
+                "duration": time.monotonic() - started_at,
+                "status": "할당량 초과", "error": str(e),
+                "ttfb": call_stats.get("ttfb"),
+                "events": call_stats.get("events", 0),
+                "pcm_bytes": call_stats.get("pcm_bytes", 0),
+                "finish_reason": call_stats.get("finish_reason"),
+            })
+            return False
+        except Exception as e:
+            st.session_state.chunk_errors[idx] = str(e)
+            st.session_state.call_log.append({
+                "time": ts, "chunk": idx + 1, "key": start_key + 1,
+                "duration": time.monotonic() - started_at,
+                "status": "실패", "error": str(e),
+                "ttfb": call_stats.get("ttfb"),
+                "events": call_stats.get("events", 0),
+                "pcm_bytes": call_stats.get("pcm_bytes", 0),
+                "finish_reason": call_stats.get("finish_reason"),
+            })
+            return False
+
+    pending_count = sum(1 for i in range(total_chunks) if i not in st.session_state.chunk_audios)
+    if pending_count > 0:
+        if st.session_state.batch_running:
+            if st.button("⏸ 일괄 생성 중지", use_container_width=True, type="secondary"):
+                st.session_state.batch_running = False
+                st.rerun()
+        else:
+            if st.button(
+                f"▶ 모든 청크 자동 생성 ({pending_count}개 남음)",
+                use_container_width=True, type="primary",
+            ):
+                for i in range(total_chunks):
+                    st.session_state.chunk_errors.pop(i, None)
+                st.session_state.batch_running = True
+                st.rerun()
 
     st.caption(f"🔑 현재 사용 중인 Gemini 키: #{st.session_state.gemini_key_idx + 1}")
 
@@ -499,77 +596,25 @@ if text and chunks_preview:
                 btn_label = "🔁 재시도" if has_error else "▶ 생성"
                 btn_type = "secondary" if has_error else "primary"
                 if st.button(btn_label, key=f"gen_{i}", type=btn_type, use_container_width=True):
-                    start_key = st.session_state.gemini_key_idx
-                    started_at = time.monotonic()
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    call_stats = {}
                     with st.spinner(f"청크 {i + 1} 생성 중..."):
-                        try:
-                            if engine == "Gemini TTS (신규)":
-                                wavs, new_idx = synthesize_gemini_chunk(
-                                    gemini_key_pool,
-                                    st.session_state.gemini_key_idx,
-                                    chunk, model, voice_name,
-                                    style_prompt=style_prompt,
-                                    seed=seed_value,
-                                    temperature=temperature_value,
-                                    stats=call_stats,
-                                )
-                                st.session_state.gemini_key_idx = new_idx
-                                audio_bytes = merge_wavs(wavs)
-                                used_key = new_idx + 1
-                            else:
-                                audio_bytes = synthesize(
-                                    active_key, chunk, voice_name,
-                                    language_code=language_code,
-                                    speaking_rate=speaking_rate, pitch=pitch,
-                                )
-                                used_key = 1
-                            st.session_state.chunk_audios[i] = audio_bytes
-                            st.session_state.chunk_errors.pop(i, None)
-                            st.session_state.call_log.append({
-                                "time": ts,
-                                "chunk": i + 1,
-                                "key": used_key,
-                                "duration": time.monotonic() - started_at,
-                                "status": "성공",
-                                "error": None,
-                                "ttfb": call_stats.get("ttfb"),
-                                "events": call_stats.get("events", 0),
-                                "pcm_bytes": call_stats.get("pcm_bytes", 0),
-                                "finish_reason": call_stats.get("finish_reason"),
-                            })
-                            st.rerun()
-                        except QuotaExceeded as e:
-                            st.session_state.chunk_errors[i] = (
-                                f"🚫 모든 API 키의 할당량이 소진되었습니다. "
-                                f"사이드바에 백업 키를 추가하거나 내일 다시 시도하세요.\n\n{e}"
-                            )
-                            st.session_state.call_log.append({
-                                "time": ts,
-                                "chunk": i + 1,
-                                "key": start_key + 1,
-                                "duration": time.monotonic() - started_at,
-                                "status": "할당량 초과",
-                                "error": str(e),
-                                "ttfb": call_stats.get("ttfb"),
-                                "events": call_stats.get("events", 0),
-                                "pcm_bytes": call_stats.get("pcm_bytes", 0),
-                                "finish_reason": call_stats.get("finish_reason"),
-                            })
-                            st.rerun()
-                        except Exception as e:
-                            st.session_state.chunk_errors[i] = str(e)
-                            st.session_state.call_log.append({
-                                "time": ts,
-                                "chunk": i + 1,
-                                "key": start_key + 1,
-                                "duration": time.monotonic() - started_at,
-                                "status": "실패",
-                                "error": str(e),
-                                "ttfb": call_stats.get("ttfb"),
-                                "events": call_stats.get("events", 0),
-                                "pcm_bytes": call_stats.get("pcm_bytes", 0),
-                                "finish_reason": call_stats.get("finish_reason"),
-                            })
-                            st.rerun()
+                        _generate_chunk(i, chunk)
+                    st.rerun()
+
+    if st.session_state.batch_running:
+        pending = [
+            i for i in range(total_chunks)
+            if i not in st.session_state.chunk_audios
+        ]
+        if not pending:
+            st.session_state.batch_running = False
+            st.rerun()
+        else:
+            next_i = pending[0]
+            with st.spinner(
+                f"⏩ 일괄 생성 중... 청크 {next_i + 1}/{total_chunks} "
+                f"({len(pending)}개 남음)"
+            ):
+                ok = _generate_chunk(next_i, chunks_preview[next_i])
+            if not ok:
+                st.session_state.batch_running = False
+            st.rerun()

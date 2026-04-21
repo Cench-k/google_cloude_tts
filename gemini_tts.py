@@ -53,14 +53,14 @@ GEMINI_VOICES = [
 ]
 
 GEMINI_CONNECT_TIMEOUT = 30
-GEMINI_READ_TIMEOUT = 180
+GEMINI_READ_TIMEOUT = 300
 
 MODEL_MAX_BYTES = {
     "gemini-3.1-flash-tts-preview": 1500,
-    "gemini-2.5-flash-preview-tts": 1200,
-    "gemini-2.5-pro-preview-tts": 1200,
+    "gemini-2.5-flash-preview-tts": 1000,
+    "gemini-2.5-pro-preview-tts": 1000,
 }
-DEFAULT_MAX_BYTES = 1200
+DEFAULT_MAX_BYTES = 1000
 
 
 def get_max_bytes(model: str) -> int:

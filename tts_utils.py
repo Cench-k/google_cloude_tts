@@ -136,6 +136,8 @@ def split_text(text, max_bytes=MAX_BYTES, max_sentence_bytes=None):
             para, max_bytes, max_sentence_bytes=max_sentence_bytes
         )
         if not sub_chunks:
+            sub_chunks = _force_split_by_bytes(para, max_bytes)
+        if not sub_chunks:
             continue
         chunks.extend(sub_chunks[:-1])
         current = sub_chunks[-1]
