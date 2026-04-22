@@ -40,7 +40,7 @@ def _force_split_by_bytes(s: str, max_bytes: int) -> list[str]:
 def _refine_long_sentence(s: str, max_sentence_bytes: int) -> list[str]:
     if _bytelen(s) <= max_sentence_bytes:
         return [s]
-    parts = re.split(r"(?<=[,，、;；:])\s*", s)
+    parts = re.split(r"(?<=[,，、;；:])", s)
     out = []
     for p in parts:
         if _bytelen(p) <= max_sentence_bytes:
@@ -66,7 +66,7 @@ def _refine_long_sentence(s: str, max_sentence_bytes: int) -> list[str]:
 
 
 def _split_paragraph_by_sentences(para, max_bytes, max_sentence_bytes=None):
-    sentences = re.split(r"(?<=[.!?。！？\n])\s*", para)
+    sentences = re.split(r"(?<=[.!?。！？\n])", para)
     units = []
     for s in sentences:
         if not s:
@@ -139,8 +139,7 @@ def split_text(text, max_bytes=MAX_BYTES, max_sentence_bytes=None):
             sub_chunks = _force_split_by_bytes(para, max_bytes)
         if not sub_chunks:
             continue
-        chunks.extend(sub_chunks[:-1])
-        current = sub_chunks[-1]
+        chunks.extend(sub_chunks)
 
     if current:
         chunks.append(current)
