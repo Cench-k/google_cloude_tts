@@ -67,7 +67,7 @@ def _refine_long_sentence(s: str, max_sentence_bytes: int) -> list[str]:
 
 def _split_paragraph_by_sentences(para, max_bytes, max_sentence_bytes=None):
     sentence_cap = max_sentence_bytes or max_bytes
-    sentences = re.split(r"(?<=[.!?。！？\n])", para)
+    sentences = re.split(r"(?<=[.!?。！？\n])|(?<=[다요까])(?=\s)", para)
     units = []
     for s in sentences:
         if not s:
